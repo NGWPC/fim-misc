@@ -1,5 +1,5 @@
 ## Purpose
-Read `main.py` docstring
+Read python files' docstrings
 
 ## Getting Started
 
@@ -21,6 +21,7 @@ Read `main.py` docstring
 3. **Run the Script:**
    Inside the Docker container, navigate to the `/src` directory (if not already there) and run the `main.py` script:
    ```bash
-   python main.py -o /data/outputs -oc EPSG:5070 -or 3 -smr 10 -su feet -pp 4 -ll INFO
+   python create_extent_rasters.py -o /data/outputs -oc EPSG:5070 -or 3 -smr 10 -su feet -pp 4 -ll INFO
+   python align_depth_rasters.py -o /data/outputs -rd /vsis3/fimc-data/benchmark/high_resolution_validation_data_ble  -pp 4 -ll INFO
    ```
    Replace the arguments with appropriate values as needed.
