@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-This script processes depth raster data from GeoDatabases (GDB) and align them to extent rasters for different flood risk levels. It involves the following steps:
+This script processes depth raster data from GeoDatabases (GDB) and aligns them to extent rasters for different flood risk levels. It involves the following steps:
 
 1. Reading HUC identifiers and corresponding GDB GDAL paths from a CSV file.
 2. For each HUC, retrieving raster data representing different flood risk levels (e.g., "100yr" and "500yr").
@@ -25,10 +25,9 @@ Requirements:
 - GDAL/OGR with Python bindings
 - Access permissions for specified directories and files
 
-The `bfe_hucs_gdal_paths.csv` file should be avialable adjacent to create.py and contain rows with HUC identifiers and
+The `bfe_hucs_gdal_paths.csv` file should be available adjacent to create.py and contain rows with HUC identifiers and
 corresponding GDAL paths to their GeoDatabases.
 """
-
 
 import argparse
 import csv
@@ -39,7 +38,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing import Manager
-from timeit import default_timer
+from typing import Tuple, Optional
 
 from osgeo import gdal, osr
 
@@ -55,46 +54,41 @@ class HUCProcessingRecord:
     message: str = ""
     end_time: datetime = field(default_factory=datetime.now)
 
-    def update_on_error(self, error_type: str, error_message: str):
+    def update_on_error(self, error_type: str, error_message: str) -> None:
         self.end_time = datetime.now()
         self.error = error_type
         self.status = "failed"
         self.message = error_message
 
-    def update_on_success(self):
+    def update_on_success(self) -> None:
         self.end_time = datetime.now()
         self.status = "success"
 
-def get_depth_raster_path(gdb_gdal_path, risk):
+
+def get_depth_raster_path(gdb_gdal_path: str, risk: list) -> Optional[str]:
     main_dataset = gdal.Open(gdb_gdal_path, gdal.GA_ReadOnly)
     if not main_dataset:
         return None
     subdatasets = main_dataset.GetSubDatasets()
     for sub in subdatasets:
         ds_name = sub[0].rpartition(":")[2].lower()
-        if any([word in ds_name for word in risk])  and "dep" in ds_name:
+        if any(word in ds_name for word in risk) and "dep" in ds_name:
             return sub[0]
     return None
 
 
-def get_raster_info(gdal_path):
+def get_raster_info(gdal_path: str) -> Tuple[Optional[tuple], Optional[float], Optional[osr.SpatialReference]]:
     ds = gdal.Open(gdal_path, gdal.GA_ReadOnly)
     if not ds:
         return None, None, None
 
-    # Get geotransform
     gt = ds.GetGeoTransform()
-
-    # Get raster dimensions
     width = ds.RasterXSize
     height = ds.RasterYSize
-
-    # Calculate extent coordinates
     xmin = gt[0]
     ymax = gt[3]
     xmax = xmin + width * gt[1] + height * gt[2]
     ymin = ymax + width * gt[4] + height * gt[5]
-
     extent = (xmin, ymin, xmax, ymax)
     srs = osr.SpatialReference()
     srs.ImportFromWkt(ds.GetProjection())
@@ -103,47 +97,40 @@ def get_raster_info(gdal_path):
 
 
 def process_huc(
-    huc,
-    gdb_gdal_path,
-    reference_dir,
-    output_dir,
-    log_level,
-    log_folder: str,
-    lock,
+    huc: str, gdb_gdal_path: str, reference_dir: str, output_dir: str, log_level: int, log_folder: str, lock
 ) -> None:
-
     start_time = datetime.now()
-
     logger = setup_logging(log_level, f"{log_folder}/{huc}")
     processing_record = HUCProcessingRecord(huc=huc, start_time=start_time)
     logger.info("Starting processing...")
-    try:
 
+    try:
         # 1. Get Source Raster Extent, Resolution and CRS
-	    # 100yr and 500yr have same resolution, extent etc
+        # 100yr and 500yr have same resolution, extent etc
         extent, res, srs = get_raster_info(f"{reference_dir}/{huc}/100yr/ble_huc_{huc}_extent_100yr.tif")
         if res is None:
             logger.error(f"Incorrect Reference Raster path")
             processing_record.update_on_error("FileNotFound", "Reference Raster not found")
             return
-        epsg_code_str = f"EPSG:{srs.GetAuthorityCode(None)}"
 
+        epsg_code_str = f"EPSG:{srs.GetAuthorityCode(None)}"
         # 2. Get Depth Rasters GDAL Paths from GDB
-        risks = [["500yr", ["0_2pct"], "", None], ["100yr", ["1pct", ], "", None]]
+
+        risks = [["500yr", ["0_2pct"], "", None], ["100yr", ["1pct"], "", None]]
         output_hucdir_path = os.path.join(output_dir, huc)
 
         for risk_value in risks:
             output_raster = os.path.join(output_hucdir_path, risk_value[0], f"ble_huc_{huc}_depth_{risk_value[0]}.tif")
             risk_value[2] = output_raster
-
             risk_value[3] = get_depth_raster_path(gdb_gdal_path, risk_value[1])
-            if risk_value[3] == None:
-                logger.error(f"Incorrect GDB GDAL path")
+
+            if risk_value[3] is None:
+                logger.error("Incorrect GDB GDAL path")
                 processing_record.update_on_error("FileNotFound", "GDB not found")
                 return
 
-        if all([os.path.exists(risk_value[2]) for risk_value in risks]):
-            logger.info(f"Processing skipped as outputs already exist")
+        if all(os.path.exists(risk_value[2]) for risk_value in risks):
+            logger.info("Processing skipped as outputs already exist")
             processing_record.update_on_success()
             return
 
@@ -158,11 +145,14 @@ def process_huc(
                 epsg_code_str,
                 "-tr",
                 str(res),
-		        str(res),
+                str(res),
                 "-r",
                 "bilinear",
                 "-te",
-                str(extent[0]), str(extent[1]), str(extent[2]), str(extent[3]),
+                str(extent[0]),
+                str(extent[1]),
+                str(extent[2]),
+                str(extent[3]),
                 "-of",
                 "COG",
                 "-dstnodata",
@@ -176,7 +166,6 @@ def process_huc(
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to align raster: {e.stderr}")
                 processing_record.update_on_error("SubprocessError", str(e))
-
 
         # 4.Update Raster Statistics as raster statistics are m
         for risk_value in risks:
@@ -241,7 +230,13 @@ def parse_arguments():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Align BLE Benchmark Depth Rasters to Extent Rasters")
     parser.add_argument("-o", "--output_dir", required=True, type=str, help="Directory path for output data.")
-    parser.add_argument("-rd", "--reference_dir", required=True, type=str, help="Base directory path containing the reference extent rasters.")
+    parser.add_argument(
+        "-rd",
+        "--reference_dir",
+        required=True,
+        type=str,
+        help="Base directory path containing the reference extent rasters.",
+    )
     parser.add_argument(
         "-pp", "--parallel_processes_count", default=None, type=int, help="Number of hucs to process simultaneously."
     )
@@ -270,27 +265,15 @@ def main():
     hucs_list = []
     with open("bfe_hucs_gdal_paths.csv", mode="r") as csvfile:
         csvreader = csv.reader(csvfile)
-        next(csvreader, None)  # Skip the header
-        for row in csvreader:
-            hucs_list.append(row)
+        next(csvreader, None)  # skip the header
+        hucs_list = [row for row in csvreader]
 
-    gdal.UseExceptions()
+    lock = Manager().Lock()
 
-    m = Manager()
-    lock = m.Lock()
-
-    logger.info(f"Executing individual hucs...")
     with ProcessPoolExecutor(max_workers=args.parallel_processes_count) as executor:
         for row in hucs_list:
             executor.submit(
-                process_huc,
-                row[0],
-                row[1],
-                args.reference_dir,
-                args.output_dir,
-                log_level,
-                run_time_str,
-                lock,
+                process_huc, row[0], row[1], args.reference_dir, args.output_dir, log_level, run_time_str, lock
             )
 
     logger.info(f"Completed in {datetime.now() - run_time}")
