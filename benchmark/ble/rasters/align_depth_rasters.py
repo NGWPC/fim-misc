@@ -33,6 +33,7 @@ import argparse
 import csv
 import logging
 import os
+import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -65,16 +66,16 @@ class HUCProcessingRecord:
         self.status = "success"
 
 
-def get_depth_raster_path(gdb_gdal_path: str, risk: list) -> Optional[str]:
+def get_depth_raster_path(gdb_gdal_path: str, risk: list) -> str:
     main_dataset = gdal.Open(gdb_gdal_path, gdal.GA_ReadOnly)
     if not main_dataset:
-        return None
+        return ""
     subdatasets = main_dataset.GetSubDatasets()
     for sub in subdatasets:
         ds_name = sub[0].rpartition(":")[2].lower()
         if any(word in ds_name for word in risk) and "dep" in ds_name:
             return sub[0]
-    return None
+    return ""
 
 
 def get_raster_info(gdal_path: str) -> Tuple[Optional[tuple], Optional[float], Optional[osr.SpatialReference]]:
@@ -116,31 +117,37 @@ def process_huc(
         epsg_code_str = f"EPSG:{srs.GetAuthorityCode(None)}"
         # 2. Get Depth Rasters GDAL Paths from GDB
 
-        risks = [["500yr", ["0_2pct"], "", None], ["100yr", ["1pct"], "", None]]
+        risks = [
+            ["500yr", ["0_2pct"], "output_raster", "output_tmp_raster", ""],
+            ["100yr", ["1pct"], "output_raster", "output_tmp_raster", ""],
+        ]
         output_hucdir_path = os.path.join(output_dir, huc)
 
         for risk_value in risks:
-            output_raster = os.path.join(output_hucdir_path, risk_value[0], f"ble_huc_{huc}_depth_{risk_value[0]}.tif")
-            risk_value[2] = output_raster
-            risk_value[3] = get_depth_raster_path(gdb_gdal_path, risk_value[1])
+            risk_value[2] = os.path.join(output_hucdir_path, risk_value[0], f"ble_huc_{huc}_depth_{risk_value[0]}.tif")
+            risk_value[3] = os.path.join(
+                output_dir, "tmp", huc, risk_value[0], f"ble_huc_{huc}_depth_{risk_value[0]}.tif"
+            )
+            risk_value[4] = get_depth_raster_path(gdb_gdal_path, risk_value[1])
 
-            if risk_value[3] is None:
+            if not risk_value[4]:
                 logger.error("Incorrect GDB GDAL path")
                 processing_record.update_on_error("FileNotFound", "GDB not found")
                 return
 
-        if all(os.path.exists(risk_value[2]) for risk_value in risks):
-            logger.info("Processing skipped as outputs already exist")
-            processing_record.update_on_success()
-            return
-
         # 3. Align Raster
         for risk_value in risks:
+
+            if os.path.exists(risk_value[2]):
+                logger.info(f"Processing skipped as outputs already exist for {risk_value[0]}")
+                continue
+
             logger.info(f"Aligning depth map for {risk_value[0]}...")
-            output_raster = risk_value[2]
-            os.makedirs(os.path.dirname(output_raster), exist_ok=True)
+            output_tmp_raster = risk_value[3]
+            os.makedirs(os.path.dirname(output_tmp_raster), exist_ok=True)
             gdal_warp_cmd = [
                 "gdalwarp",
+                "-overwrite",
                 "-t_srs",
                 epsg_code_str,
                 "-tr",
@@ -157,8 +164,8 @@ def process_huc(
                 "COG",
                 "-dstnodata",
                 "-9999",
-                risk_value[3],
-                output_raster,
+                risk_value[4],
+                output_tmp_raster,
             ]
             try:
                 result = subprocess.run(gdal_warp_cmd, check=True, text=True, capture_output=True)
@@ -166,22 +173,26 @@ def process_huc(
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to align raster: {e.stderr}")
                 processing_record.update_on_error("SubprocessError", str(e))
+                return
 
-        # 4.Update Raster Statistics as raster statistics are m
-        for risk_value in risks:
+            # 4. Move rasters to final location after everything is complete
+            # so as to distinguish from rasters that are incomplete
+            logger.info(f"Moving Raster...")
+            os.makedirs(os.path.dirname(risk_value[2]), exist_ok=True)
+            shutil.move(output_tmp_raster, risk_value[2])
+
+            # 5.Update Raster Statistics as raster statistics (not important)
             logger.info(f"Updating raster stats {risk_value[0]}...")
-            output_raster = risk_value[2]
             gdalinfo_cmd = [
                 "gdalinfo",
                 "-stats",
-                output_raster,
+                risk_value[2],
             ]
             try:
                 result = subprocess.run(gdalinfo_cmd, check=True, text=True, capture_output=True)
                 logger.info(f"Raster stats updated successfully: {result.stdout}")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to update raster stats: {e.stderr}")
-                processing_record.update_on_error("SubprocessError", str(e))
 
         logger.info(f"Completed in {datetime.now() - start_time}")
         processing_record.update_on_success()
