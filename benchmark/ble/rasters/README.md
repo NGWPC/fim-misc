@@ -1,5 +1,5 @@
 ## Purpose
-Read python files' docstrings
+Provide scripts to create high resolution, standardized BLE inundation and depth rasters from source BLE Geodatabases. Read python files' docstrings for further information..
 
 ## Getting Started
 
@@ -7,7 +7,7 @@ Read python files' docstrings
    Use example env file provided to create the environment file if working with S3 data, else create a blank env file or comment out env part in the docker compose.
 
 1. **Create `bfe_hucs_gdal_paths.csv`:**
-   Use sample file provided to create `bfe_hucs_gdal_paths.csv`
+   Use sample file provided to create `bfe_hucs_gdal_paths.csv`. This file is being used as input arguments. Each record in this CSV will be processed.
 
 1. **Start Docker Compose:**
    Navigate to this folder and start the Docker container using Docker Compose:
