@@ -3,6 +3,8 @@ Provide scripts to create high resolution, standardized BLE inundation and depth
 
 ## Getting Started
 
+It is assumed that docker is installed and running prior to execution of following commands.
+
 1. **Create `.env`:**
    Use example env file provided to create the environment file if working with S3 data, else create a blank env file or comment out env part in the docker compose.
 
