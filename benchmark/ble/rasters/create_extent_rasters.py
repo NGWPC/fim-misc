@@ -24,11 +24,11 @@ Requirements:
 - GDAL/OGR with Python bindings
 - Necessary permissions to access and write to the specified directories and files
 
-The `bfe_hucs_gdal_paths.csv` file should be avialable adjacent to main.py and contain rows with HUC identifiers and
+The `bfe_hucs_gdal_paths.csv` file should be avialable adjacent to create.py and contain rows with HUC identifiers and
 corresponding GDAL paths to their GeoDatabases.
 
 Example:
-`python main.py -o /path/to/output -oc EPSG:5070 -or 3 -smr 10 -su feet -pp 4 -ll INFO`
+`python create_extent_rasters.py -o /path/to/output -oc EPSG:5070 -or 3 -smr 10 -su feet -pp 4 -ll INFO`
 
 Where:
 - -o: Output directory path

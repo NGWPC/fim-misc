@@ -1,2 +1,6 @@
 .python-version
 **/.venv
+*.log
+*.tif
+*.csv
+*.xml
