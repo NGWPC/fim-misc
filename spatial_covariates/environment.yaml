@@ -1,0 +1,14 @@
+name: resolution_analysis
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip==24.0
+  - pip:
+    - geopandas
+    - rioxarray
+    - py3dep
+    - pygeohydro
+    - pynhd
+    - xarray-spatial
+    - tqdm
