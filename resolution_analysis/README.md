@@ -38,3 +38,5 @@ Should be ran in the following order:
     - Same columns as before but added: 'resolution', 'test_case_id', 'median_slope', 'freq_high_dev', 'percent_covered_by_tiles'
 - `metric_analysis.py`
   - Creates varies plots to analyze relationships among metrics, covariates, and resolution across benchmark regions.
+- `recommend_algorithm.py`
+  - Creates GPKG with recommended depression filling algorithm based on exit statuses by HUC8.

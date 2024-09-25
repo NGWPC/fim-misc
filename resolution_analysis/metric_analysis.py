@@ -767,21 +767,24 @@ def difference_histogram(metrics, plot_output_dir):
             summary = metrics_diff[metrics_diff['resolution_diff'] == diff][metric].describe()
             n = len(metrics_diff[metrics_diff['resolution_diff'] == diff][metric])
 
-            # add the statistics to the plot upper right corner
-            ax.text(0.68, 0.55, f'Mean: {summary["mean"]:.2f}\nStd: {summary["std"]:.2f}\nMedian: {summary["50%"]:.2f}\n25th: {summary["25%"]:.2f}\n75th: {summary["75%"]:.2f}\nMin: {summary["min"]:.2f}\nMax: {summary["max"]:.2f}\nSample Size: {n}', fontsize=8, transform=ax.transAxes)
+            # add the statistics to the plot upper right corner, also add 5 and 95 percentiles
+            #ax.text(0.68, 0.55, f'Mean: {summary["mean"]:.2f}\nStd: {summary["std"]:.2f}\nMedian: {summary["50%"]:.2f}\n25th: {summary["25%"]:.2f}\n75th: {summary["75%"]:.2f}\nMin: {summary["min"]:.2f}\nMax: {summary["max"]:.2f}\nN: {n}\n5th: {metrics_diff[metrics_diff['resolution_diff'] == diff][metric].quantile(0.05):.2f}\n95th: {metrics_diff[metrics_diff['resolution_diff'] == diff][metric].quantile(0.95):.2f}', fontsize=8, transform=ax.transAxes)
+
+            # above block gives: SyntaxError: f-string: unmatched '['
+            ax.text(0.68, 0.45, f'Mean: {summary["mean"]:.2f}\nStd: {summary["std"]:.2f}\nMedian: {summary["50%"]:.2f}\n25th: {summary["25%"]:.2f}\n75th: {summary["75%"]:.2f}\nMin: {summary["min"]:.2f}\nMax: {summary["max"]:.2f}\nN: {n}\n10th: {metrics_diff[metrics_diff["resolution_diff"] == diff][metric].quantile(0.1):.2f}\n90th: {metrics_diff[metrics_diff["resolution_diff"] == diff][metric].quantile(0.9):.2f}', fontsize=8, transform=ax.transAxes)
 
             # compute mean absolute deviation
             mad = np.mean(np.abs(metrics_diff[metrics_diff['resolution_diff'] == diff][metric] - summary['mean']))
 
             # plot normal distribution curve on ax with mean and standard deviation
             x = np.linspace(-0.1, 0.1, 100)
-            y = stats.laplace.pdf(x, loc=summary['mean'], scale=mad)
+            y = stats.norm.pdf(x, loc=summary['mean'], scale=summary['std'])
 
             # normalize y to match the histogram
             # get the bin width from the plot
             bin_width = ax.patches[1].get_x() - ax.patches[0].get_x()
 
-            #ax.plot(x, y * n * bin_width, color='red')
+            ax.plot(x, y * n * bin_width, color='red')
 
         # set the x-label
         plt.text(-.2, -.2, f'Metric Differences Across Resolutions: {diff.upper()}m', ha='center', va='center', transform=plt.gca().transAxes)
@@ -790,6 +793,12 @@ def difference_histogram(metrics, plot_output_dir):
         #fig.legend(
         #    loc=(0.75, 0.9), ncol=3, title='Resolution Difference (m)', labels=['3-10', '5-10', '5-3'], handles=saved_legend.legend_handles
         #)
+
+        # make legend just for pdf line
+        from matplotlib.lines import Line2D
+        fig.legend(
+            loc=(0.75, 0.9), ncol=1, labels=['Normal Distribution'], handles=[Line2D([0], [0], color='red', lw=2, label='Normal Distribution')]
+        )
 
         # set the title
         fig.suptitle(f'Metric by Resolution Difference (USGS & NWS @ Action & Minor): {diff.upper()}m')
@@ -882,6 +891,230 @@ def scatter_plot_covariates_and_metrics_by_resolution(metrics, plot_output_dir):
     # close the figure
     plt.close()
 
+def counts_plot(metrics, plot_output_dir):
+
+    counts_df = metrics[(metrics['Exit status'] == 0)].dropna(subset=['MCC', 'CSI', 'TPR', 'FAR']).groupby(['benchmark_source', 'magnitude', 'resolution'])[['MCC']].count().reset_index(drop=False).rename(columns={'MCC' : 'counts'})
+
+    # counts df columns: benchmark_source, magnitude, resolution, counts
+
+    # with counts df make a figure with 4 subplots, one for each benchmark_source, with 2 rows and 2 columns. sources are ble, nws, usgs, ras2fim. Make bar plot with a bar for each resolution grouped by magnitude. The counts is what to plot. Order the legend according to a specific magnitude order by benchmark source
+
+    # create a figure
+    fig, axs = plt.subplots(2, 2, figsize=(9, 6), sharex=False, sharey=False)
+
+    # set magnitude order
+    nws_usgs_mag_order = ['action', 'minor', 'moderate', 'major']
+    ras2fim_mag_order = ['2yr', '5yr', '10yr', '25yr', '50yr', '100yr']
+    ble_mag_order = ['100yr', '500yr']
+
+    # resolution order
+    res_order = [10, 5, 3]
+
+    # loop through each benchmark source
+    for i, (benchmark_source, mag_order) in enumerate(
+        zip(['ble', 'nws', 'usgs', 'ras2fim'],
+        [ble_mag_order, nws_usgs_mag_order, nws_usgs_mag_order, ras2fim_mag_order])
+    ):
+            
+            # get the axes
+            ax = axs.flatten()[i]
+    
+            # make a bar plot
+            sns.barplot(
+                x='magnitude', y='counts', data=counts_df[counts_df['benchmark_source'] == benchmark_source], ax=ax, hue='resolution', hue_order=res_order, palette='bright', order=mag_order
+            )
+    
+            # set the title
+            ax.set_title(f'{benchmark_source.upper()}')
+    
+            # set the y-label
+            if (i == 0) | (i == 2):
+                ax.set_ylabel('Counts')
+                if i == 0:
+                    saved_legend = ax.get_legend()
+            else:
+                ax.set_ylabel('')
+    
+            ax.set_xlabel('')
+    
+            # remove the legend
+            ax.get_legend().remove()
+
+            # make sure y tick labels are integers
+            from matplotlib.ticker import MaxNLocator
+            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+
+    # set the x-label
+    plt.text(-.2, -.2, 'Magnitude', ha='center', va='center', transform=plt.gca().transAxes)
+
+    # make the legend
+    fig.legend(
+        loc=(0.75, 0.9), ncol=3, title='Resolution (m)', labels=['10', '5', '3'], handles=saved_legend.legend_handles
+    )
+
+    # set the title
+    fig.suptitle(f'Sample Sizes by Benchmark, Magnitude & Resolution')
+
+    # save the figure
+    plt.savefig(os.path.join(plot_output_dir, f'sample_size_plot.png'))
+
+    # close the figure
+    plt.close()
+
+
+def metric_difference_by_covariate(metrics, plot_output_dir, hist_var='median_slope_log'):
+    '''
+    For each metric, make a box-plot of positive and negative differences
+    '''
+
+    # make a copy of the data
+    metrics = metrics.copy()
+
+    # only keep test_case_id that have all resolutions
+    #metrics = metrics.groupby('test_case_id').filter(lambda x: set(x['resolution']) == {10, 5, 3})
+
+    # make a list of metrics
+    metrics_list = ['MCC', 'CSI', 'TPR', 'FAR']
+
+    # subset benchmark source
+    metrics = metrics[metrics['benchmark_source'].isin(['usgs', 'nws'])]
+
+    # subset magnitude
+    metrics = metrics[metrics['magnitude'].isin(['action', 'minor'])]
+
+    # set x order
+    mag_vals = ['action', 'minor']
+
+    # set magnitude and resolution as categories
+    magnitudes = metrics['magnitude']
+    resolutions = metrics['resolution']
+
+    # drop the magnitude and resolution columns
+    metrics = metrics.drop(columns=['magnitude', 'resolution'])
+
+    # set the categories
+    metrics.loc[:, 'magnitude'] = pd.Categorical(magnitudes, categories=mag_vals, ordered=True)
+    metrics.loc[:, 'resolution'] = pd.Categorical(resolutions, categories=[10, 5, 3], ordered=True)
+
+    # for every resolution difference, compute the difference between the two resolutions
+    metrics_diff_list = []
+    #for diff in ['3-10', '3-5', '5-10']:
+    diff = '3-10'
+
+    if diff == '3-10':
+        reses = [3, 10]
+    elif diff == '3-5':
+        reses = [3, 5]
+    else:
+        reses = [5, 10]
+
+    metrics_diff = (
+        metrics[(metrics.resolution == reses[0])].set_index(['test_case_id', 'magnitude', 'benchmark_source'])[metrics_list] - metrics[(metrics.resolution == reses[1])].set_index(['test_case_id', 'magnitude'])[metrics_list]
+    ).reset_index().dropna().merge(metrics.drop(columns=metrics_list), on=['test_case_id', 'magnitude', 'benchmark_source'], how='left').drop_duplicates(subset=['test_case_id', 'magnitude', 'benchmark_source'] + metrics_list)
+
+    metrics_diff['resolution_diff'] = diff
+
+    metrics_diff_list.append(metrics_diff)
+
+    # drop resolution column
+    metrics_diff = pd.concat(metrics_diff_list, ignore_index=True).drop(columns='resolution')
+
+    # set resolution_diff as category
+    resolution_diffs = metrics_diff['resolution_diff']
+    metrics_diff.drop(columns='resolution_diff', inplace=True)
+    metrics_diff['resolution_diff'] = pd.Categorical(resolution_diffs, categories=['3-10', '3-5', '5-10'], ordered=True)
+
+    # fit logistic regression model for CSI. Use median_slope_log and freq_high_dev_log as predictors. Use resolution_diff > 0 and resolution_diff < 0 as response categories
+    metrics_diff['CSI_diff_positive'] = metrics_diff['CSI'].apply(lambda x: 'Positive' if x > 0 else 'Non-Positive')
+    metrics_diff['MCC_diff_positive'] = metrics_diff['MCC'].apply(lambda x: 'Positive' if x > 0 else 'Non-Positive')
+    metrics_diff['TPR_diff_positive'] = metrics_diff['TPR'].apply(lambda x: 'Positive' if x > 0 else 'Non-Positive')
+    metrics_diff['FAR_diff_positive'] = metrics_diff['FAR'].apply(lambda x: 'Positive' if x > 0 else 'Non-Positive')
+    #metrics_diff['resolution_diff_not_positive'] = metrics_diff['resolution_diff'].apply(lambda x: 1 if x == '10-3' else 0)
+
+    # set resolution_diff_positive to category
+    metrics_diff['CSI_diff_positive'] = metrics_diff['CSI_diff_positive'].astype('category')
+    metrics_diff['MCC_diff_positive'] = metrics_diff['MCC_diff_positive'].astype('category')
+    metrics_diff['TPR_diff_positive'] = metrics_diff['TPR_diff_positive'].astype('category')
+    metrics_diff['FAR_diff_positive'] = metrics_diff['FAR_diff_positive'].astype('category')
+
+    # make histogram of median_slope_log and freq_high_dev_log
+    # in each histogram use resolution_diff_positive as hue
+    if hist_var == 'median_slope_log':
+        x_var = 'median_slope_log'
+        x_axis_label = 'Log Median Slope'
+        title = 'Log of Median Slope by Metric Difference'
+    else:
+        x_var = 'freq_high_dev_log'
+        x_axis_label = 'Log Frequency High-Dev LC'
+        title = 'Log of Frequency High-Dev LC by Metric Difference'
+
+    # create a figure
+    fig, axs = plt.subplots(2, 2, figsize=(9, 6), sharex=True, sharey=False)
+
+    # make histogram for CSI
+    for i, metric in enumerate(metrics_list):
+            
+        # get the axes
+        ax = axs.flatten()[i]
+
+        # make a boxplot
+        sns.histplot(
+            x=x_var, data=metrics_diff, ax=ax, hue='CSI_diff_positive', palette='bright', bins=50, kde=True
+        )
+
+        # set the title
+        ax.set_title(f'{metric}')
+
+        # set the y-label
+        if (i == 0) | (i == 2):
+            ax.set_ylabel('Frequency')
+            if i == 0:
+                saved_legend = ax.get_legend()
+        else:
+            ax.set_ylabel('')
+
+        ax.set_xlabel('')
+
+        # remove the legend
+        ax.get_legend().remove()
+
+        # compute the means, std devs, medians, 25th, 75th, min, max, and sample size for each hue
+        for hue, x_spot in zip(['Positive', 'Non-Positive'], [0.01, 0.3]):
+            summary = metrics_diff[metrics_diff['CSI_diff_positive'] == hue][x_var].describe()
+            n = len(metrics_diff[metrics_diff['CSI_diff_positive'] == hue][x_var])
+
+            # add the statistics to the plot upper right corner, also add 5 and 95 percentiles
+            #ax.text(x_spot, 0.47, f'{hue}\nMean: {summary["mean"]:.2f}\nStd: {summary["std"]:.2f}\nMedian: {summary["50%"]:.2f}\n25th: {summary["25%"]:.2f}\n75th: {summary["75%"]:.2f}\nMin: {summary["min"]:.2f}\nMax: {summary["max"]:.2f}\nN: {n}', fontsize=8, transform=ax.transAxes)
+
+    # set the x-label
+    plt.text(-.2, -.2, x_axis_label, ha='center', va='center', transform=plt.gca().transAxes)
+
+    # make the legend
+    fig.legend(
+        loc=(0.75, 0.9), ncol=2, title='Positive or Non-Positive', labels=['Pos.', 'Non-Pos.'], handles=saved_legend.legend_handles
+    )
+
+    # set the title
+    fig.suptitle(title)
+
+    # add text as a footnote
+    plt.text(-1, -0.25, 'USGS & NWS @ Action & Minor, (3-10m)', ha='center', va='center', transform=plt.gca().transAxes, fontsize=12)
+
+    # save the figure
+    plt.savefig(os.path.join(plot_output_dir, f'histogram_{hist_var}_by_metric_diff.png'))
+
+    plt.close()
+
+
+    # fit logistic regression model for CSI. Use median_slope_log and freq_high_dev_log as predictors. Use resolution_diff > 0 and resolution_diff < 0 as response categories
+    #import statsmodels
+    #from statsmodels.formula.api import logit
+    #model = logit('resolution_diff_positive ~ median_slope_log + freq_high_dev_log', data=metrics_diff).fit()
+
+    # make a copy of the data
+    #print(model.summary())
+
 
 if __name__ == '__main__':
         
@@ -904,6 +1137,11 @@ if __name__ == '__main__':
 
         plot_output_dir = os.path.join('data', 'plots', 'metric_analysis')
         os.makedirs(plot_output_dir, exist_ok=True)
+
+
+        # doing this here to avoid dropping ras2fm
+        print('Computing counts plot...')
+        counts_plot(metrics, plot_output_dir)
 
 
         # drop ras2fim
@@ -931,22 +1169,22 @@ if __name__ == '__main__':
         metrics = compute_logs(metrics)
 
         print('Computing box plots by tile availability ...')
-        #box_plots_by_tile_availability(metrics, plot_output_dir)
+        box_plots_by_tile_availability(metrics, plot_output_dir)
 
         print('Computing box plots by resolution and magnitude ...')
-        #box_plots_by_resolution_and_magnitude(metrics[ble_bool], 'ble', plot_output_dir)
-        #box_plots_by_resolution_and_magnitude(metrics[nws_bool], 'nws', plot_output_dir)
-        #box_plots_by_resolution_and_magnitude(metrics[usgs_bool], 'usgs', plot_output_dir)
-        #box_plots_by_resolution_and_magnitude(metrics_ras2fim, 'ras2fim', plot_output_dir)
+        box_plots_by_resolution_and_magnitude(metrics[ble_bool], 'ble', plot_output_dir)
+        box_plots_by_resolution_and_magnitude(metrics[nws_bool], 'nws', plot_output_dir)
+        box_plots_by_resolution_and_magnitude(metrics[usgs_bool], 'usgs', plot_output_dir)
+        box_plots_by_resolution_and_magnitude(metrics_ras2fim, 'ras2fim', plot_output_dir)
         
         print('Computing scatter plots...')
-        #for benchmark_source in ['ble', 'nws', 'usgs']:
-            #covariate_scatter_plots(metrics, plot_output_dir, benchmark_source)
+        for benchmark_source in ['ble', 'nws', 'usgs']:
+            covariate_scatter_plots(metrics, plot_output_dir, benchmark_source)
             
         print('Computing scatter plot matrix...')
-        #scatter_plot_matrix(metrics, plot_output_dir)
+        scatter_plot_matrix(metrics, plot_output_dir)
 
-        print('Computing histogram of compute and storage costs by algorithm...')
+        #print('Computing histogram of compute and storage costs by algorithm...')
         # dropping duplicate huc, algorithm pairs
         # onlt relevant if there are multiple algorithms
         """
@@ -964,26 +1202,30 @@ if __name__ == '__main__':
 
         print('Computing boxplot of algorithm performance...')
         # there is only one algorithm so not currently relevant
-        #boxplot_of_algorithm_performance(metrics, 'all', plot_output_dir)
-        #boxplot_of_algorithm_performance(metrics[ble_bool], 'ble', plot_output_dir)
-        #boxplot_of_algorithm_performance(metrics[nws_bool], 'nws', plot_output_dir)
-        #boxplot_of_algorithm_performance(metrics[usgs_bool], 'usgs', plot_output_dir)
-        #boxplot_of_algorithm_performance(metrics[ras2fim_bool], 'ras2fim', plot_output_dir)
+        boxplot_of_algorithm_performance(metrics, 'all', plot_output_dir)
+        boxplot_of_algorithm_performance(metrics[ble_bool], 'ble', plot_output_dir)
+        boxplot_of_algorithm_performance(metrics[nws_bool], 'nws', plot_output_dir)
+        boxplot_of_algorithm_performance(metrics[usgs_bool], 'usgs', plot_output_dir)
+        boxplot_of_algorithm_performance(metrics[ras2fim_bool], 'ras2fim', plot_output_dir)
 
         print('Computing box plot of compute performance by resolutions...')
         # HUCs completed by resolution for wbt: 1441 (10m), 1429 (5m), 207 (3m), total 1451
-        #box_plot_of_compute_performance_by_resolutions(compute_metrics, plot_output_dir, usd=False, total_hucs=1451)
-        #box_plot_of_compute_performance_by_resolutions(compute_metrics, plot_output_dir, usd=True, total_hucs=1451)
+        box_plot_of_compute_performance_by_resolutions(compute_metrics, plot_output_dir, usd=False, total_hucs=1451)
+        box_plot_of_compute_performance_by_resolutions(compute_metrics, plot_output_dir, usd=True, total_hucs=1451)
 
         print('Building tile regression model...')
-        #build_tile_regression_model(metrics, plot_output_dir, categorical=True)
-        #build_tile_regression_model(metrics, plot_output_dir, categorical=False)
+        build_tile_regression_model(metrics, plot_output_dir, categorical=True)
+        build_tile_regression_model(metrics, plot_output_dir, categorical=False)
 
         print('Computing difference histogram...')
-        #difference_histogram(metrics, plot_output_dir)
+        difference_histogram(metrics, plot_output_dir)
 
         print('Computing scatter plot of covariates and metrics by resolution...')
         scatter_plot_covariates_and_metrics_by_resolution(metrics, plot_output_dir)
+
+        print('Metric difference by covariate...')
+        metric_difference_by_covariate(metrics, plot_output_dir, hist_var='median_slope_log')
+        metric_difference_by_covariate(metrics, plot_output_dir, hist_var='freq_high_dev_log')
 
         '''
         r = check_combinations(
