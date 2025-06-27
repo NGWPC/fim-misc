@@ -11,15 +11,18 @@ import sys
 from pathlib import Path
 import geopandas as gpd
 import pandas as pd
+import warnings
+
+warnings.filterwarnings("ignore", message=".*initial implementation of Parquet.*")
 
 # ── paths you can tweak ───────────────────────────────────────────────────────
-CATCHMENT_PATH = Path("/efs/fim-data/hand_fim/temp/brad/subset_nwm_catchments.gpkg")
+CATCHMENT_PATH = Path('/efs/fim-data/hand_fim/inputs/nwm_hydrofabric/nwm_catchments.gpkg')
 HUC12_PATH     = Path("/efs/fim-data/hand_fim/inputs/wbd/WBD_National.gpkg")
-OUTPUT_BASE    = Path("/efs/fim-data/hand_fim/temp/brad/hwm2")
+OUTPUT_BASE    = Path("/efs/fim-data/hand_fim/temp/brad/hwm3")
 # ──────────────────────────────────────────────────────────────────────────────
 
-CATCHMENT_ID_FIELD = "ID"          # in subset catchments
-CSV_ID_FIELD       = "feature_id"  # in *_flowfile.csv*
+CATCHMENT_ID_FIELD = "ID"
+CSV_ID_FIELD       = "feature_id"
 HUC_LAYER_NAME     = "WBDHU12"
 HUC12_FIELD        = "HUC12"
 
@@ -66,7 +69,6 @@ def main(root_dir: Path) -> None:
         .set_index(HUC12_FIELD)
     )
 
-    # speed up spatial joins if pygeos/rtree is available
     gpd.options.use_pygeos = True
 
     # ── walk through all “*-item” dirs ────────────────────────────────────────
@@ -82,39 +84,54 @@ def main(root_dir: Path) -> None:
             continue
 
         print(f"→ Processing {gpkg_path.relative_to(root_dir)}")
+        stem_name = gpkg_path.stem
 
-        # read point layer
         points = gpd.read_file(gpkg_path)
+
+        # Reproject to match catchments
         if points.crs != catchments.crs:
             points = points.to_crs(catchments.crs)
 
-        # add catchment feature_id
+        # spatial join to catchments → feature_id
         points = (
             gpd.sjoin(points, catchments.reset_index(), how="left", op="within")
             .rename(columns={CATCHMENT_ID_FIELD: "feature_id"})
             .drop(columns=["index_right"])
         )
 
-        # add HUC12
-        points = (
-            gpd.sjoin(points, huc12s.reset_index(), how="left", op="within")
-            .rename(columns={HUC12_FIELD: "HUC12"})
-            .drop(columns=["index_right"])
-        )
+        # spatial join to HUC12 layer
+        if points.crs != huc12s.crs:
+            points = points.to_crs(huc12s.crs)
 
-        # derive HUC10 / HUC8 / HUC6
-        points["HUC10"] = points["HUC12"].str[:10]
-        points["HUC8"]  = points["HUC12"].str[:8]
-        points["HUC6"]  = points["HUC12"].str[:6]
+        points = gpd.sjoin(points, huc12s.reset_index(), how="left", op="within")
+        if HUC12_FIELD not in points.columns:
+            raise RuntimeError(f"Field '{HUC12_FIELD}' not found after HUC12 spatial join")
 
-        # attach discharge
+        points.drop(columns=["index_right"], inplace=True)
+        points.rename(columns={HUC12_FIELD: "HUC12"}, inplace=True)
+
+        # Derive HUC codes with zero padding
+        points["HUC12"] = points["HUC12"].astype(str).str.zfill(12)
+        points["HUC10"] = points["HUC12"].str[:10].str.zfill(10)
+        points["HUC8"]  = points["HUC12"].str[:8].str.zfill(8)
+        points["HUC6"]  = points["HUC12"].str[:6].str.zfill(6)
+
+        # attach discharge by feature_id
         discharge_tbl = (
             pd.read_csv(csv_path, usecols=[CSV_ID_FIELD, "discharge"])
             .rename(columns={CSV_ID_FIELD: "feature_id", "discharge": "flow"})
         )
         points = points.merge(discharge_tbl, on="feature_id", how="left")
 
-        # ensure blank columns exist with correct dtypes
+        # set fixed values
+        points["magnitude"]  = stem_name
+        points["submitter"]  = "usgs"
+        points["coll_time"]  = None
+        points["flow_unit"]  = "cms"
+        points["layer"]      = None
+        points["path"]       = None
+
+        # ensure all NEW_COLS exist
         for col, dtype in NEW_COLS.items():
             if col not in points.columns:
                 points[col] = pd.Series(dtype=dtype)
@@ -126,8 +143,23 @@ def main(root_dir: Path) -> None:
         out_parquet = out_dir / (gpkg_path.stem + OUT_PQ_SUFFIX)
         points.to_parquet(out_parquet, index=False)
 
-        # GeoPackage: drop user 'fid' to avoid Fiona schema error
-        gpkg_safe = points.drop(columns=["fid"], errors="ignore")
+        # Clean for GPKG write
+        gpkg_safe = points.copy()
+        drop_cols = [
+            "fid", "files", "networkNames", "hwm_qualities",
+            "vertical_collect_methods", "horizontal_collect_methods"
+        ]
+        col_names_lower = gpkg_safe.columns.str.lower()
+        cols_to_drop = [col for col in gpkg_safe.columns
+                        if col_names_lower.duplicated().any() and
+                        list(col_names_lower).count(col.lower()) > 1]
+        gpkg_safe = gpkg_safe.drop(columns=list(set(drop_cols + cols_to_drop)), errors="ignore")
+
+        # Remove null or invalid geometries
+        gpkg_safe = gpkg_safe[gpkg_safe.geometry.notnull()]
+        gpkg_safe = gpkg_safe[gpkg_safe.is_valid]
+        gpkg_safe = gpkg_safe[gpkg_safe.geometry.geom_type == "Point"]
+
         out_gpkg = out_dir / (gpkg_path.stem + ".gpkg")
         gpkg_safe.to_file(out_gpkg, driver="GPKG")
 
