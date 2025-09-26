@@ -1,8 +1,8 @@
 """
-Get spatial covariates (slope and NLCD) for the FIM60 HUC8s.
+Get spatial covariates (slope and NLCD) for the FIM60 HUCs.
 """
 
-
+import argparse
 import os
 import gc
 from time import sleep
@@ -25,7 +25,7 @@ with warnings.catch_warnings():
 os.environ["HYRIVER_CACHE_DISABLE"] = "true"
 
 
-def get_slope(geoseries, resolution=30, geo_crs=4326, crs=5070, m2m=True, to_file=None, id='huc8'):
+def get_slope(geoseries, resolution=30, geo_crs=4326, crs=5070, m2m=True, to_file=None, id='huc'):
     """
     Get slope from a geometry using py3dep and xrspatial.
     """
@@ -37,7 +37,7 @@ def get_slope(geoseries, resolution=30, geo_crs=4326, crs=5070, m2m=True, to_fil
     slope = xrspatial.slope(dem)
     slope_attrs = 'degrees'
     if m2m:
-        slope = py3dep.utils.deg2mpm(slope)
+        slope = py3dep.geoops.deg2mpm(slope)
         slope_attrs = 'm/m'
     
     # set slope attributes
@@ -55,7 +55,7 @@ def get_slope(geoseries, resolution=30, geo_crs=4326, crs=5070, m2m=True, to_fil
     return slope
 
 
-def get_nlcd(geoseries, resolution=30, geo_crs=4326, crs=5070, region=None, to_file=None, id='huc8'):
+def get_nlcd(geoseries, resolution=30, geo_crs=4326, crs=5070, region=None, to_file=None, id='huc'):
     """
     Get NLCD from a geometry using py3dep.
     """
@@ -79,19 +79,21 @@ def get_nlcd(geoseries, resolution=30, geo_crs=4326, crs=5070, region=None, to_f
     return nlcd
 
 def main(
-    huc8s,
+    hucs,
     id,
-    huc8s_layer=None,
+    hucs_layer=None,
     output_dir='data',
-    huc8s_output_dir='huc8s',
+    hucs_output_dir='hucs',
     max_retries=3,
+    num_jobs=1,
+    resolution=30,
 ):
 
-    # open the huc8s
-    print('Reading huc8s...')
-    huc8s = gpd.read_file(huc8s, layer=huc8s_layer).to_crs(4326)
+    # open the hucs
+    print('Reading hucs...')
+    hucs = gpd.read_file(hucs, layer=hucs_layer).to_crs(4326)
 
-    # make huc8s column for nlcd retrieval
+    # make hucs column for nlcd retrieval
     print('Adding region column to states ...')
     states = gh.get_us_states().to_crs(4326)
     states.loc[~states.STUSPS.isin(['AK','PR','HI']),'region'] = 'L48'
@@ -102,114 +104,199 @@ def main(
 
     #spatial join
     print('Spatial join to get regions ...')
-    huc8s = (
-        huc8s
-        .loc[:, ['HUC8', 'geometry']]
-        .dissolve(by='HUC8')
+    hucs = (
+        hucs
+        .loc[:, [id, 'geometry']]
+        .dissolve(by=id)
         .reset_index(drop=False)
         .sjoin(states, how='left', predicate='intersects')
         .drop(columns='index_right')
         .reset_index(drop=True)
-        .dissolve(by='HUC8')
+        .dissolve(by=id)
         .reset_index(drop=False)
-        .loc[:, ['HUC8', 'geometry', 'region']]
+        .loc[:, [id, 'geometry', 'region']]
         .to_crs(4326)
     )
 
     del states
 
-    output_dir = 'data'
-    huc8s_output_dir = os.path.join(output_dir, huc8s_output_dir)
-    slope_output_dir = os.path.join(huc8s_output_dir, 'slope')
-    nlcd_output_dir = os.path.join(huc8s_output_dir, 'nlcd')
+    hucs_output_dir = os.path.join(output_dir, hucs_output_dir)
+    slope_output_dir = os.path.join(hucs_output_dir, 'slope')
+    nlcd_output_dir = os.path.join(hucs_output_dir, 'nlcd')
     
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(huc8s_output_dir, exist_ok=True)
+    os.makedirs(hucs_output_dir, exist_ok=True)
     os.makedirs(slope_output_dir, exist_ok=True)
     os.makedirs(nlcd_output_dir, exist_ok=True)
 
-    for _, row in tqdm(huc8s.iterrows(), total=len(huc8s), desc='Processing huc8s'):
+    if num_jobs == 1:
 
-        try:
-            slope_fn = os.path.join(slope_output_dir, 'slope_{}.tif'.format(row[id]))
-            retries = 0
-            while retries < max_retries:
-                try:
-                    # get slope
-                    slope = get_slope(
-                        row, to_file=slope_fn, id=id, geo_crs=4326, crs=5070
-                    )
-                except:
-                    retries += 1
-                    if retries >= max_retries:
-                        slope = None
-                        #print(f'Failed to get slope for {row[id]}')
-                    
-                    sleep(10)
-                    continue
-                else:
-                    break
+        for _, row in tqdm(hucs.iterrows(), total=len(hucs), desc='Processing hucs'):
 
-        except Exception as e:
-            print(row[id], 'slope failed', e, e.__traceback__.tb_lineno)
-            continue
+            try:
+                slope_fn = os.path.join(slope_output_dir, 'slope_{}.tif'.format(row[id]))
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        # get slope
+                        slope = get_slope(
+                            row, to_file=slope_fn, id=id, geo_crs=4326, crs=5070, resolution=resolution
+                        )
+                    except:
+                        retries += 1
+                        if retries >= max_retries:
+                            print(f'Failed to get slope for {row[id]}, retrying...')
+                            slope = None
+                        
+                        sleep(10)
+                        continue
+                    else:
+                        break
 
-        try:
-            slope.close()
-        except AttributeError:
-            pass
-        del slope
-        gc.collect()
-        
+            except Exception as e:
+                print(row[id], 'slope failed', e, e.__traceback__.tb_lineno)
+                continue
 
-        try:
+            try:
+                slope.close()
+            except AttributeError:
+                pass
+            del slope
+            gc.collect()
+            
 
-            nlcd_fn = os.path.join(nlcd_output_dir,'nlcd_{}.tif'.format(row[id]))
-            retries = 0
-            while retries < max_retries:
-                try:
-                    # get NLCD
-                    nlcd = get_nlcd(
-                        row, to_file=nlcd_fn, id=id, region=row['region'], geo_crs=4326, crs=5070
-                    )
-                    
-                except:
-                    retries += 1
-                    if retries >= max_retries:
-                        #breakpoint()
-                        nlcd = None
-                        #print(f'Failed to get NLCD for {row[id]}')
-                    
-                    sleep(10)
-                    continue
-                else:
-                    break
-                    
-        except Exception as e:
-            print(row[id], 'nlcd failed', e, e.__traceback__.tb_lineno)
-            continue
+            try:
 
-        try:
-            nlcd.close()
-        except AttributeError:
-            pass
-        del nlcd
-        gc.collect()
+                nlcd_fn = os.path.join(nlcd_output_dir,'nlcd_{}.tif'.format(row[id]))
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        # get NLCD
+                        nlcd = get_nlcd(
+                            row, to_file=nlcd_fn, id=id, region=row['region'], geo_crs=4326, crs=5070, resolution=resolution
+                        )
+                        
+                    except:
+                        retries += 1
+                        if retries >= max_retries:
+                            print(f'Failed to get NLCD for {row[id]}, retrying...')
+                            nlcd = None
+                        
+                        sleep(10)
+                        continue
+                    else:
+                        break
+                        
+            except Exception as e:
+                print(row[id], 'nlcd failed', e, e.__traceback__.tb_lineno)
+                continue
+
+            try:
+                nlcd.close()
+            except AttributeError:
+                pass
+            del nlcd
+            gc.collect()
+
+    else:
+        def _process_row(row):
+
+            try:
+                slope_fn = os.path.join(slope_output_dir, 'slope_{}.tif'.format(row[id]))
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        # get slope
+                        slope = get_slope(
+                            row, to_file=slope_fn, id=id, geo_crs=4326, crs=5070, resolution=resolution
+                        )
+                    except:
+                        retries += 1
+                        if retries >= max_retries:
+                            slope = None
+                            print(f'Failed to get slope for {row[id]}, retrying...')
+                        
+                        sleep(10)
+                        continue
+                    else:
+                        break
+
+            except Exception as e:
+                print(row[id], 'slope failed', e, e.__traceback__.tb_lineno)
+                pass
+
+            try:
+                slope.close()
+            except AttributeError:
+                pass
+            del slope
+            gc.collect()
+            
+
+            try:
+
+                nlcd_fn = os.path.join(nlcd_output_dir,'nlcd_{}.tif'.format(row[id]))
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        # get NLCD
+                        nlcd = get_nlcd(
+                            row, to_file=nlcd_fn, id=id, region=row['region'], geo_crs=4326, crs=5070, resolution=resolution
+                        )
+                        
+                    except:
+                        retries += 1
+                        if retries >= max_retries:
+                            nlcd = None
+                            print(f'Failed to get NLCD for {row[id]}, retrying...')
+                        
+                        sleep(10)
+                        continue
+                    else:
+                        break
+                        
+            except Exception as e:
+                print(row[id], 'nlcd failed', e, e.__traceback__.tb_lineno)
+                pass
+
+            try:
+                nlcd.close()
+            except AttributeError:
+                pass
+            del nlcd
+            gc.collect()
+
+        # parallel processing
+        from joblib import Parallel, delayed
+        Parallel(n_jobs=num_jobs, backend='loky')(
+            delayed(_process_row)(row) for _, row in tqdm(hucs.iterrows(), total=len(hucs), desc='Processing hucs')
+        )
+
 
 if __name__ == "__main__":
 
-    huc8s = os.path.join('data', 'ALL_FIM60_HUC8s.gpkg') # os.path.join('data', 'benchmark_maps.gpkg')
-    id = 'HUC8' # test_case_id
-    huc8s_layer = None
-    output_dir = 'data'
-    huc8s_output_dir = 'huc8s' # 'benchmarks'
-    max_retries = 10
+    #hucs = os.path.join(os.path.join(os.path.expanduser('~'), 'data','foss_fim', 'inputs', 'wbd', 'ALL_FIM100_HUC12s.gpkg')) # os.path.join('data', 'benchmark_maps.gpkg')
+    #id = 'HUC12' # test_case_id 
+    #hucs_layer = None
+    #output_dir = os.path.join(os.path.expanduser('~'), 'data','foss_fim', 'misc','resolution_analysis')
+    #hucs_output_dir = 'hucs' # 'benchmarks'
+    #max_retries = 10
+    #num_jobs = 1
+    #resolution = 100
 
-    main(
-        huc8s,
-        id,
-        huc8s_layer=huc8s_layer,
-        output_dir=output_dir,
-        huc8s_output_dir=huc8s_output_dir,
-        max_retries=max_retries
-    )
+    # above args with argparse
+    parser = argparse.ArgumentParser(description='Get spatial covariates for HUCs.')
+    parser.add_argument('--hucs', type=str, help='Path to HUCs file', required=True)
+    parser.add_argument('--id', type=str, help='HUCs ID column name', required=True, default='HUC12')
+    parser.add_argument('--hucs_layer', type=str, help='HUCs layer name', required=False, default=None)
+    parser.add_argument('--output_dir', type=str, help='Output directory', required=False, default='data')
+    parser.add_argument('--hucs_output_dir', type=str, help='HUCs output directory', required=False, default='hucs')
+    parser.add_argument('--max_retries', type=int, help='Max retries for getting covariates', required=False, default=10)
+    parser.add_argument('--num_jobs', type=int, help='Number of jobs to run in parallel', required=False, default=1)
+    parser.add_argument('--resolution', type=int, help='Resolution of covariates', required=False, default=30)
+
+    # example usage:
+    # python3 get_spatial_covariates.py --hucs ~/foss_data/inputs/wbd/ALL_FIM100_HUC12s.gpkg --id HUC12 --output_dir ~/foss_data/misc/resolution_analysis --hucs_output_dir hucs --max_retries 10 --num_jobs 7 --resolution 30
+    args = parser.parse_args()
+
+    main(**vars(args))

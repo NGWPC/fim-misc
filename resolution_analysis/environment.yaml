@@ -13,3 +13,6 @@ dependencies:
     - xarray-spatial
     - tqdm
     - seaborn==0.13.2
+    - dask
+    - pystac
+    - pystac-client

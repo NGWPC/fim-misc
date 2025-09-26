@@ -1,5 +1,6 @@
 
 import os
+import argparse
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -8,17 +9,17 @@ from scipy import stats
 from tqdm import tqdm
 
 
-def median_slope_histogram(covariates, area):
+def median_slope_histogram(covariates, area, output_dir):
 
     # covariates is a dataframe in memory
     n = len(covariates)
 
     if area == 'huc':
-        title = f'Median Slope Histogram (FIM60 HUC8s)'
+        title = f'Median Slope Histogram (FIM100 HUC12s)'
         xlim = (0, 0.5)
         bins = 100
     elif area == 'benchmarks':
-        title = f'Median Slope Histogram (FIM60 Benchmarks)'
+        title = f'Median Slope Histogram (FIM100 Benchmarks)'
         xlim = (0, 0.2)
         bins = 50
 
@@ -44,21 +45,21 @@ def median_slope_histogram(covariates, area):
     )
 
     # save the plot
-    plt.savefig(f'data/plots/median_slope_histogram_{area}.png')
+    plt.savefig(os.path.join(output_dir, f'median_slope_histogram_{area}.png'))
 
     # close the plot
     plt.close()
 
-def freq_high_dev_histogram(covariates, area):
+def freq_high_dev_histogram(covariates, area, output_dir):
 
     n = len(covariates)
 
     if area == 'huc':
-        title = f'High Developed LC Frequency Histogram (FIM60 HUC8s)'
+        title = f'High Developed LC Frequency Histogram (FIM100 HUC12s)'
         bins = 100
         xlim = (0, 0.01)
     elif area == 'benchmarks':
-        title = f'High Developed LC Frequency Histogram (FIM60 Benchmarks)'
+        title = f'High Developed LC Frequency Histogram (FIM100 Benchmarks)'
         bins = 50
         xlim = (0, 0.025)
 
@@ -88,12 +89,12 @@ def freq_high_dev_histogram(covariates, area):
     )
 
     # save the plot
-    plt.savefig(f'data/plots/freq_high_dev_histogram_{area}.png')
+    plt.savefig(os.path.join(output_dir, f'freq_high_dev_histogram_{area}.png'))
 
     # close the plot
     plt.close()
 
-def slope_and_freq_scatter(covariates, area):
+def slope_and_freq_scatter(covariates, area, output_dir):
 
     n = len(covariates)
 
@@ -104,20 +105,20 @@ def slope_and_freq_scatter(covariates, area):
     plt.ylabel('High Developed LC Frequency')
 
     if area == 'huc':
-        title = f'High Developed LC vs Median Slope (FIM60 HUC8s)'
+        title = f'High Developed LC vs Median Slope (FIM100 HUC12s)'
     elif area == 'benchmarks':
-        title = f'High Developed LC vs Median Slope (FIM60 Benchmarks)'
+        title = f'High Developed LC vs Median Slope (FIM100 Benchmarks)'
     
     plt.title(title)
 
     # save
-    plt.savefig(f'data/plots/slope_and_freq_scatter_{area}.png')
+    plt.savefig(os.path.join(output_dir, f'slope_and_freq_scatter_{area}.png'))
 
     # close
     plt.close()
 
 
-def slope_and_freq_scatter_log(covariates, area):
+def slope_and_freq_scatter_log(covariates, area, output_dir):
 
     covariates['median_slope_log'] = np.log10(covariates.loc[~np.isclose(covariates['median_slope'], 0),'median_slope'])
     covariates['freq_high_dev_log'] = np.log10(covariates.loc[~np.isclose(covariates['freq_high_dev'], 0),'freq_high_dev'])
@@ -135,9 +136,9 @@ def slope_and_freq_scatter_log(covariates, area):
     plt.ylabel('Log of High Developed LC Frequency')
     
     if area == 'huc':
-        title = f'Log-log: High Developed LC vs Median Slope (FIM60 HUC8s)'
+        title = f'Log-log: High Developed LC vs Median Slope (FIM100 HUC12s)'
     elif area == 'benchmarks':
-        title = f'Log-log: High Developed LC vs Median Slope (FIM60 Benchmarks)'
+        title = f'Log-log: High Developed LC vs Median Slope (FIM100 Benchmarks)'
     plt.title(title)
 
     # compute and plot correlation
@@ -158,18 +159,18 @@ def slope_and_freq_scatter_log(covariates, area):
     plt.text(0.25, 0.2, f'y={slope:.2f}x+{intercept:.2f}', fontsize=14, ha='center', va='center', transform=plt.gca().transAxes)
 
     # save the plot
-    plt.savefig(f'data/plots/slope_and_freq_scatter_log_{area}.png')
+    plt.savefig(os.path.join(output_dir, f'slope_and_freq_scatter_log_{area}.png'))
 
     # close the plot
     plt.close()
 
-def main():
+def main(huc_covariates_fn, benchmarks_covariates_fn, output_dir):
 
-    os.makedirs(os.path.join('data', 'plots'), exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     covariates_fn_list = [
-        (os.path.join('data', 'huc8s_sp.gpkg'), 'huc'),
-        (os.path.join('data', 'benchmarks_sp.gpkg'), 'benchmarks')
+        (huc_covariates_fn, 'huc'),
+        (benchmarks_covariates_fn, 'benchmarks')
     ]
     
     for cov, area in tqdm(covariates_fn_list, desc='Spatial covariates analysis'):
@@ -199,17 +200,40 @@ def main():
         '''
 
         # plot the median slope histogram
-        median_slope_histogram(covariates, area)
+        median_slope_histogram(covariates, area, output_dir)
 
         # plot the freq_high_dev histogram
-        freq_high_dev_histogram(covariates, area)
+        freq_high_dev_histogram(covariates, area, output_dir)
 
         # plot the scatter plot
-        slope_and_freq_scatter(covariates, area)
+        slope_and_freq_scatter(covariates, area, output_dir)
 
         # plot the scatter plot in log
-        slope_and_freq_scatter_log(covariates, area)
+        slope_and_freq_scatter_log(covariates, area, output_dir)
 
 if __name__ == '__main__':
-    main()
+
+    parser = argparse.ArgumentParser(description='Spatial covariates analysis')
+    parser.add_argument(
+        '-u', '--huc_covariates_fn',
+        type=str,
+        required=True,
+        help='Path to the HUC covariates file'
+    )
+    parser.add_argument(
+        '-b', '--benchmarks_covariates_fn',
+        type=str,
+        required=True,
+        help='Path to the benchmarks covariates file'
+    )
+    parser.add_argument(
+        '-o', '--output_dir',
+        type=str,
+        required=True,
+        help='Directory to save the output plots'
+    )
+
+    # example usage: python3 covariate_analysis.py -u ~/data/foss_fim/misc/resolution_analysis/spatial_covariates/hucs/hucs_spatial_covariates.gpkg -b ~/data/foss_fim/misc/resolution_analysis/spatial_covariates/test_sites/test_sites_spatial_covariates.gpkg -o ~/data/foss_fim/misc/resolution_analysis/plots/covariates_analysis
+
+    main(**vars(parser.parse_args()))
 
