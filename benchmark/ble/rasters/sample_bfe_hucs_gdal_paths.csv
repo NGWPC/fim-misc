@@ -1,0 +1,4 @@
+huc,gdal_path
+08020203,/vsizip//vsicurl/https://ebfedata.s3-us-west-2.amazonaws.com/08020203_LowerStFrancis/08020203_SpatialData.zip/Spatial/Lower_St_Francis.gdb
+12010005,/vsis3/*******/benchmark/high_resolution_validation_data_ble/12010005/500yr/ble_huc_12010005_extent_500yr.tif
+12090301,D:\Users\abdul.siddiqui\workbench\projects\fim_planning\12090301_LowerColoradoCummins\12090301_SpatialData\Spatial\BLE_LowColoradoCummins.gdb
