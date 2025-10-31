@@ -1,0 +1,28 @@
+name: depths
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - gdal
+  - rasterio
+  - rioxarray
+  - xarray
+  - libnetcdf
+  - netcdf4
+  - hdf5
+  - pyproj
+  - shapely
+  - fiona
+  - s3fs
+  - fsspec
+  - boto3
+  - tqdm
+  - odc-geo
+  - proj-data
+  - proj
+  - pyproj
+  - pip
+  - pip:
+      - pystac
+      - pystac-client
+      #- gval
+      - git+https://github.com/fernando-aristizabal/gval_owp.git@mape_epsilon
