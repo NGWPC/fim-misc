@@ -7,7 +7,7 @@ python depth_compare.py \
     --benchmark-map data/benchmark_ble_huc_12090301_depth_500yr.tif \
     --agreement-map data/agreement_dummy_ble_huc_12090301_depth_500yr.tif \
     --metrics-parquet data/depth_metrics_huc_12090301_depth_500yr.parquet \
-    --num-workers 4
+    --num-workers 6
     --epsilon 0.1
 """
 from __future__ import annotations
@@ -28,9 +28,7 @@ os.environ["GDAL_DATA"] = os.path.join(sys.prefix, "share", "gdal")
 pyproj.datadir.set_data_dir(os.environ["PROJ_LIB"])
 
 import rioxarray as rxr
-import dask.array as da
 import dask
-from pyproj import CRS
 import gval
 import geopandas as gpd
 from gval.comparison.pairing_functions import difference

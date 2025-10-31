@@ -31,10 +31,8 @@ import boto3
 import numpy as np
 import rioxarray as rxr
 import dask.array as da
-import xarray as xr
 import dask
 import odc.geo
-from odc.geo.xr import xr_reproject
 from odc.geo.xr import ODCExtensionDa
 from pyproj import CRS
 
@@ -211,30 +209,6 @@ def prepare_nonhomogenized_candidate_map(
         masked_and_scaled=True,
         chunks="auto" if chunk_size is None else {"y": chunk_size, "x": chunk_size},
     )
-    
-    """
-    # Remove top row and rightmost column
-    da_cropped = da_in.isel(y=slice(1, None), x=slice(0, -1))
-
-    # only for debugging
-    #da_cropped = da_cropped.isel(y=slice(0, chunk_size*8), x=slice(0, chunk_size*8))
-    
-    # Resample to 10m resolution
-    da_resampled = xr_reproject(
-        da_cropped,
-        how=da_in.rio.crs,
-        resolution=10,
-        resampling="bilinear"
-    )
-    
-    # Reproject to WGS84
-    da_reprojected = xr_reproject(
-        #da_resampled,
-        da_cropped,
-        how=CRS.from_epsg(4326),
-        resampling="bilinear"
-    )
-    """
     
     # Squeeze, remove top row and rightmost column and reproject to WGS84 in one step
     da_reprojected = (
