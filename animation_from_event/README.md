@@ -36,13 +36,14 @@ NWM Data (S3) → Flow Files → flows2fim → FIM GeoTIFFs → Animation Video
 
 ## Features
 
+- **Make Build System** - Simple commands for build, run, and clean workflows
 - **Fully Containerized** - Docker-based, runs anywhere
 - **S3 Integration** - Auto-downloads RIPPLE data and accesses NWM data
 - **Config-Driven** - Single YAML file for all settings
 - **Dynamic Paths** - Collection ID-based S3 paths (change once, update all)
 - **County Agnostic** - Works with any US county boundary
 - **Lake Fill** - Fill permanent water bodies in animations
-- **Customizable Viz** - Basemaps, colormaps, extents, overlays
+- **Customizable Visualization** - Basemaps, colormaps, extents, overlays
 - **Parallel Processing** - Multi-threaded FIM generation
 
 ---
@@ -300,11 +301,11 @@ This runs all four steps:
 ```bash
 # Initial run: Pull full event data (e.g., 7 days)
 # Edit config.yaml: start_date: 2025-07-04, end_date: 2025-07-11
-make run-workflow  # Takes 45-90 minutes
+make run-workflow --skip-animation
 
-# Later: Create different animations from same data
-# Just modify animation settings in config.yaml (extent, colormap, etc.)
-make generate-animation  # Takes ~ 5-10 minutes
+# Later: Create different animations (subset of full timeserires from comprehensive data)
+# Just modify animation settings (and start / end times) in config.yaml (extent, colormap, etc.)
+make generate-animation
 
 # Or create animation for subset of time period
 docker-compose run --rm flood-animation python generate_animation.py \
@@ -361,8 +362,8 @@ docker-compose run --rm flood-animation python generate_animation.py \
   --start-time "2025-07-05 16:00" \
   --end-time "2025-07-06 12:00" \
   --output video_3.mp4
-d
-ocker-compose run --rm flood-animation python generate_animation.py \
+
+docker-compose run --rm flood-animation python generate_animation.py \
   --config config.yaml \
   --start-time "2025-07-06 12:00" \
   --end-time "2025-07-07 8:00" \
@@ -401,7 +402,7 @@ docker-compose run --rm flood-animation bash -c "\
 **Memory considerations:**
 - Each day (24 hours) = ~24-48 frames at 1-2 hour intervals
 - Peak memory usage scales with: `frames × DPI × figure_size × downsample_factor`
-- Recommended segment length: 12-24 hours per video
+- Recommended segment length: 12-20 hours per video
 - For very high resolution (DPI > 200), consider 6-12 hour segments
 
 ### Run Individual Steps
@@ -727,11 +728,16 @@ cat .env
 
 The Docker memory limits have been removed by default (see `docker-compose.yml`). Common memory related errors are `exit code -9` or  `Error 137`, If still experiencing issues:
 
+Increasing the downsample_factor:
+```yaml
+visual:
+  downsample_factor: 4  # Downsample large rasters
+```
+
 Reduce animation resolution:
 ```yaml
 visual:
   dpi: 150  # Reduce from 250
-  downsample_factor: 4  # Downsample large rasters
 ```
 
 Or reduce parallel workers in `config.yaml`:
@@ -740,14 +746,7 @@ processing:
   max_workers: 2  # Reduce from 4
 ```
 
-**For events longer than 20 hours:** Break the animation into segments and stitch them together. This is the recommended approach for multi-day events:
-
-```bash
-# See "Long-Duration Events (>20 hours)" section for detailed workflow
-# Generate segments separately, then stitch with ffmpeg
-```
-
-This approach significantly reduces peak memory usage and allows you to process very long events that would otherwise fail.
+**For events longer than 20 hours:** Break the animation into segments and stitch them together. See [Long-Duration Events](#long-duration-events-20-hours). This is the recommended approach for multi-day events:
 
 ### Disk Space Issues
 
@@ -877,6 +876,8 @@ animation_from_event/
 ├── config_utils.py          # Config loading utilities
 ├── utils_s3.py              # S3 download functions
 │
+├── test_setup.sh            # Verifies installation & environment
+│
 ├── generate_flow_files.py   # Step 1: Flow generation
 ├── generate_batch_fims.py   # Step 2: FIM generation
 ├── generate_animation.py    # Step 3: Animation creation
@@ -913,12 +914,12 @@ All data uses standard container paths (not user-specific):
 
 ```bash
 # Setup
-make setup          # Create directories, copy .env
-make build          # Build Docker image
+make setup              # Create directories, copy .env
+make build              # Build Docker image
 
 # Run
-make run-workflow   # Complete workflow (all steps)
-make shell          # Interactive shell in container
+make run-workflow       # Complete workflow (all steps)
+make shell              # Interactive shell in container
 
 # Generate individual steps
 make generate-flows     # Generate flow files from NWM data
@@ -926,13 +927,13 @@ make generate-fims      # Generate FIM GeoTIFFs
 make generate-animation # Generate animation video
 
 # Utilities
-make download-lake  # Download lake polygon (interactive)
+make download-lake      # Download lake polygon (interactive)
 
 # Cleanup
-make clean          # Remove output files (data/output, data/cache)
-make clean-all      # Remove output + Docker images and volumes
-make logs           # Show Docker logs
-make help           # Show all commands
+make clean              # Remove output files (data/output, data/cache)
+make clean-all          # Remove output + Docker images and volumes
+make logs               # Show Docker logs
+make help               # Show all commands
 ```
 
 ### Python Script Arguments
@@ -981,16 +982,7 @@ Modify `generate_animation.py` to support additional video formats (MP4, AVI, GI
 
 ---
 
-## System Requirements
-
-### Minimum
-
-- **CPU:** 2 cores
-- **RAM:** 8 GB
-- **Disk:** 20 GB free space
-- **OS:** Linux, macOS, Windows (with Docker)
-
-### Recommended
+## Recommended System Requirements
 
 - **CPU:** 4+ cores (for parallel processing)
 - **RAM:** 16 GB
@@ -1019,38 +1011,3 @@ Modify `generate_animation.py` to support additional video formats (MP4, AVI, GI
 See [`requirements.txt`](requirements.txt) for full list.
 
 ---
-
-## Support
-
-### Documentation
-
-- This README (comprehensive guide)
-- Inline comments in `config.yaml`
-- Script docstrings (`--help` flags)
-
-### Troubleshooting
-
-1. Check [Troubleshooting](#troubleshooting) section above
-2. Review Docker logs: `docker-compose logs`
-3. Test individual steps: `make generate-flows`, etc.
-4. Check file paths and permissions
-
----
-
-## Version History
-
-### v1.0.0 (2026-01-02)
-- Initial release
-- Fully containerized workflow
-- Config-driven operation
-- S3 integration with dynamic paths
-- make commands
-- Lake fill feature
-- County-agnostic boundary support
-- flows2fim binary integration
-
----
-
-**Created:** 2026-01-02
-**Tool:** Flood Animation from Event
-**Maintainer:** NGWPC
