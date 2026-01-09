@@ -1,0 +1,38 @@
+services:
+  flood-animation:
+    build: .
+    image: flood-animation:latest
+    container_name: flood-animation-tool
+
+    # Mount current directory to /data
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+
+    # Override command for interactive shell
+    # command: /bin/bash
+
+    # Resource limits
+    # Note: Memory limits removed to allow Docker's use of host memory as needed
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4.0'
+    #       memory: 16G
+    #     reservations:
+    #       cpus: '2.0'
+    #       memory: 4G
+
+  # Service for running the full workflow
+  workflow:
+    extends: flood-animation
+    container_name: flood-animation-workflow
+    command: python run_workflow.py --config /app/config.yaml
