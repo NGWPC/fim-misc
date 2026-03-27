@@ -349,6 +349,172 @@ def compare_structures(
     return domain_structures, summary
 
 
+def compare_stream_orders(
+    candidate_map,
+    benchmark_map,
+    agreement_map,
+    catchments_path: str | os.PathLike,
+    flows_path: str | os.PathLike,
+    output_dir: str | os.PathLike | None = None,
+    metrics: str | Iterable[str] = "all",
+    epsilon: float = 0.1,
+    units: str = "feet",
+):
+    """
+    Compute GVAL depth metrics per stream order by clipping the candidate
+    and benchmark maps to catchments of each stream order.
+
+    Parameters
+    ----------
+    candidate_map : xr.DataArray
+        Candidate depth map (homogenized, domain-clipped).
+    benchmark_map : xr.DataArray
+        Benchmark depth map (homogenized, domain-clipped).
+    agreement_map : xr.DataArray
+        Agreement map (candidate - benchmark).
+    catchments_path : str or os.PathLike
+        Path to NWM catchments GeoPackage.
+    flows_path : str or os.PathLike
+        Path to NWM flows GeoPackage (must have ID and order_ columns).
+    output_dir : str or os.PathLike, optional
+        Directory to save per-SO metrics parquets and a combined parquet.
+    metrics : str or Iterable[str], default = "all"
+        Metrics to compute via GVAL.
+    epsilon : float, default = 0.1
+        Epsilon for GVAL metrics.
+    units : str, default = "feet"
+        Units of the input rasters.
+
+    Returns
+    -------
+    dict
+        {stream_order: pd.DataFrame} of GVAL metrics per stream order.
+    """
+    from shapely.geometry import box
+
+    # Compute into memory if needed
+    if hasattr(agreement_map, "compute"):
+        agreement_map = agreement_map.compute()
+    if hasattr(candidate_map, "compute"):
+        candidate_map = candidate_map.compute()
+    if hasattr(benchmark_map, "compute"):
+        benchmark_map = benchmark_map.compute()
+
+    # Build spatial mask from agreement raster bounds
+    bounds = agreement_map.rio.bounds()
+    domain_box = box(bounds[0], bounds[1], bounds[2], bounds[3])
+    domain_mask = gpd.GeoDataFrame(geometry=[domain_box], crs=agreement_map.rio.crs)
+
+    # Load catchments intersecting domain
+    print("Loading catchments within agreement domain...")
+    catchments = gpd.read_file(catchments_path, mask=domain_mask)
+    print(f"  Found {len(catchments)} catchments in domain")
+
+    if len(catchments) == 0:
+        return {}
+
+    # Join stream order from flows
+    print("  Reading flow attributes for stream order...")
+    flows = gpd.read_file(flows_path, columns=["ID", "order_"])
+    flows_df = pd.DataFrame({"ID": flows["ID"], "order_": flows["order_"]})
+    del flows
+    gc.collect()
+
+    catchments = catchments.merge(flows_df, on="ID", how="left")
+    catchments = catchments.dropna(subset=["order_"])
+    catchments["order_"] = catchments["order_"].astype(int)
+    print(f"  Catchments with stream order: {len(catchments)}")
+    print(f"  Stream orders found: {sorted(catchments['order_'].unique())}")
+
+    # Ensure CRS matches the raster
+    if catchments.crs != agreement_map.rio.crs:
+        catchments = catchments.to_crs(agreement_map.rio.crs)
+
+    so_metrics = {}
+    ft_scale = 0.3048 if units == "meters" else 1.0
+
+    for so, grp in catchments.groupby("order_"):
+        so = int(so)
+        print(f"\n  Processing SO{so} ({len(grp)} catchments)...")
+        geoms = grp.geometry.values
+
+        # Clip all three rasters to this SO's catchments
+        try:
+            clipped_agreement = agreement_map.rio.clip(geoms, agreement_map.rio.crs,
+                                                        drop=True, all_touched=True)
+            clipped_candidate = candidate_map.rio.clip(geoms, candidate_map.rio.crs,
+                                                        drop=True, all_touched=True)
+            clipped_benchmark = benchmark_map.rio.clip(geoms, benchmark_map.rio.crs,
+                                                        drop=True, all_touched=True)
+        except Exception as e:
+            print(f"    Skipping SO{so}: clip failed ({e})")
+            continue
+
+        # Check for valid data
+        valid = clipped_agreement.values[~np.isnan(clipped_agreement.values)]
+        if len(valid) < 2:
+            print(f"    Skipping SO{so}: insufficient valid pixels ({len(valid)})")
+            continue
+
+        # Compute GVAL metrics on the clipped rasters
+        try:
+            metrics_table = _compute_continuous_metrics(
+                agreement_map=clipped_agreement,
+                candidate_map=clipped_candidate,
+                benchmark_map=clipped_benchmark,
+                metrics=metrics,
+                subsampling_df=None,
+                subsampling_average="none",
+                epsilon=epsilon,
+            )
+        except Exception as e:
+            print(f"    Skipping SO{so}: metrics computation failed ({e})")
+            continue
+
+        # Add stream order and catchment metadata
+        metrics_table["stream_order"] = so
+        metrics_table["n_catchments"] = len(grp)
+        metrics_table["area_sqkm"] = float(grp["AreaSqKM"].sum())
+        metrics_table["n_valid_pixels"] = len(valid)
+
+        # Add bias counts (same logic as compare_structures)
+        diff = valid
+        abs_diff = np.abs(diff)
+        n_over = int(np.sum(diff > ft_scale * 0.1))
+        n_under = int(np.sum(diff < -ft_scale * 0.1))
+        n_match = len(valid) - n_over - n_under
+        metrics_table["n_over_predict"] = n_over
+        metrics_table["n_under_predict"] = n_under
+        metrics_table["n_match"] = n_match
+
+        so_metrics[so] = metrics_table
+        print(f"    SO{so}: {len(valid):,} pixels, MAE={float(metrics_table['mean_absolute_error'].iloc[0]):.3f}, "
+              f"bias: under={n_under}, match={n_match}, over={n_over}")
+
+        del clipped_agreement, clipped_candidate, clipped_benchmark
+        gc.collect()
+
+    # Save outputs
+    if output_dir is not None and so_metrics:
+        os.makedirs(output_dir, exist_ok=True)
+        all_rows = []
+        for so in sorted(so_metrics.keys()):
+            df = so_metrics[so]
+            df.to_parquet(
+                os.path.join(output_dir, f"depth_metrics_so{so}.parquet"),
+                engine="pyarrow", index=False, compression="snappy",
+            )
+            all_rows.append(df)
+        combined = pd.concat(all_rows, ignore_index=True)
+        combined.to_parquet(
+            os.path.join(output_dir, "depth_metrics_by_stream_order.parquet"),
+            engine="pyarrow", index=False, compression="snappy",
+        )
+        print(f"\n  Saved per-SO metrics to {output_dir}")
+
+    return so_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare candidate depth map against benchmark depth map.")
     parser.add_argument("--candidate-map", type=str, required=True, help="Path to candidate depth map raster file.")
@@ -371,6 +537,12 @@ def main():
     parser.add_argument("--structures-gpkg", type=str, default=None, help="Path to save per-structure results as GeoPackage (includes geometry + metrics).")
     parser.add_argument("--units", type=str, default="feet", choices=["meters", "feet"],
                         help="Units of the input rasters. Affects bucket thresholds (default: feet).")
+    parser.add_argument("--catchments", type=str, default=None,
+                        help="Path to NWM catchments GeoPackage for per-stream-order analysis.")
+    parser.add_argument("--flows", type=str, default=None,
+                        help="Path to NWM flows GeoPackage (must have ID and order_ columns).")
+    parser.add_argument("--so-output-dir", type=str, default=None,
+                        help="Directory to save per-stream-order metrics parquets.")
 
     args = parser.parse_args()
 
@@ -378,6 +550,10 @@ def main():
 
     # Load subsampling points if provided
     subsampling_df = gpd.read_file(args.subsampling_file) if args.subsampling_file else None
+
+    # If SO analysis requested, delay clearing candidate/benchmark from memory
+    needs_so = args.catchments is not None and args.flows is not None
+    clear = (not args.keep_memory) and (not needs_so)
 
     # Compare depth maps
     agreement_map, metric_table = compare_depth_maps(
@@ -391,7 +567,7 @@ def main():
         metrics=args.metrics,
         nodata=args.nodata,
         encode_nodata=not args.no_encode_nodata,
-        clear_memory=not args.keep_memory,
+        clear_memory=clear,
         epsilon=args.epsilon,
     )
 
@@ -415,6 +591,48 @@ def main():
 
         print("\nStructures Metrics:")
         print(structures_summary.T)
+
+    # Compare by stream order if catchments + flows provided
+    if needs_so:
+        # Re-open candidate/benchmark since compare_depth_maps may have closed them
+        da_candidate = rxr.open_rasterio(args.candidate_map, masked=True).squeeze().compute()
+        da_benchmark = rxr.open_rasterio(args.benchmark_map, masked=True).squeeze().compute()
+
+        # Homogenize to match the agreement map grid
+        da_candidate, da_benchmark = da_candidate.gval.homogenize(
+            da_benchmark, target_map="benchmark", resampling=args.resampling,
+        )
+
+        # Apply same wet-domain masking as compare_depth_maps
+        benchmark_wet = (da_benchmark > 0) & da_benchmark.notnull()
+        candidate_wet = (da_candidate > 0) & da_candidate.notnull()
+        either_wet = benchmark_wet | candidate_wet
+        da_candidate = da_candidate.where(candidate_wet, other=0.0).where(either_wet)
+        da_benchmark = da_benchmark.where(benchmark_wet, other=0.0).where(either_wet)
+
+        so_output = args.so_output_dir
+        if so_output is None and args.agreement_map is not None:
+            so_output = os.path.join(os.path.dirname(args.agreement_map), "stream_order_metrics")
+
+        so_metrics = compare_stream_orders(
+            candidate_map=da_candidate,
+            benchmark_map=da_benchmark,
+            agreement_map=agreement_map,
+            catchments_path=args.catchments,
+            flows_path=args.flows,
+            output_dir=so_output,
+            metrics=args.metrics,
+            epsilon=args.epsilon,
+            units=args.units,
+        )
+
+        print("\nStream Order Metrics:")
+        for so in sorted(so_metrics.keys()):
+            print(f"\n  SO{so}:")
+            print(so_metrics[so].T)
+
+        del da_candidate, da_benchmark
+        gc.collect()
 
 if __name__ == "__main__":
     main()

@@ -57,6 +57,7 @@ _DEPTH_METRIC_COLS = {
 def load_data(depth_metrics_path, structures_metrics_path=None,
               structures_gpkg_path=None, agreement_map_path=None,
               catchments_path=None, flows_path=None,
+              so_metrics_dir=None,
               units="meters"):
     """Load all input data files, optionally converting depth values from meters to feet."""
     data = {}
@@ -204,39 +205,38 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
                 data["stream_order_distributions"] = so_distributions
                 data["stream_order_geometries"] = so_geometries
 
-                # Compute per-SO pixel-level raster metrics
-                print("  Computing per-stream-order raster metrics...")
-                so_raster_metrics = {}
-                for so in sorted(so_geometries.keys()):
-                    geoms = so_geometries[so]
-                    try:
-                        clipped = da.rio.clip(geoms.values, da.rio.crs, drop=True, all_touched=True)
-                    except Exception:
-                        continue
-                    vals = clipped.values.flatten()
-                    vals = vals[~np.isnan(vals)]
-                    if len(vals) < 2:
-                        continue
-                    abs_vals = np.abs(vals)
-                    mae = float(np.mean(abs_vals))
-                    mse = float(np.mean(vals ** 2))
-                    rmse = float(np.sqrt(mse))
-                    mse_signed = float(np.mean(vals))
-                    median_ae = float(np.median(abs_vals))
-                    # R² needs benchmark vs candidate; agreement = candidate - benchmark
-                    # We approximate: treat zero as "perfect" prediction
-                    ss_res = float(np.sum(vals ** 2))
-                    ss_tot = float(np.sum((vals - np.mean(vals)) ** 2))
-                    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-                    so_raster_metrics[int(so)] = {
-                        "coefficient_of_determination": r2,
-                        "mean_absolute_error": mae,
-                        "mean_signed_error": mse_signed,
-                        "root_mean_squared_error": rmse,
-                        "median_absolute_error": median_ae,
-                        "n_pixels": len(vals),
+    # Load per-SO GVAL metrics from parquet files (produced by depth_compare.py)
+    if so_metrics_dir and os.path.isdir(so_metrics_dir):
+        print(f"Loading per-SO GVAL metrics from {so_metrics_dir}...")
+        combined_path = os.path.join(so_metrics_dir, "depth_metrics_by_stream_order.parquet")
+        if os.path.exists(combined_path):
+            so_df = pd.read_parquet(combined_path)
+            if convert:
+                for col in so_df.columns:
+                    if col in _DEPTH_METRIC_COLS:
+                        if "squared" in col:
+                            so_df[col] = so_df[col] * scale_sq
+                        else:
+                            so_df[col] = so_df[col] * scale
+            so_raster_metrics = {}
+            for _, row in so_df.iterrows():
+                so = int(row["stream_order"])
+                so_raster_metrics[so] = row.drop(["band", "stream_order"], errors="ignore").to_dict()
+            data["stream_order_raster_metrics"] = so_raster_metrics
+            print(f"  Loaded GVAL metrics for stream orders: {sorted(so_raster_metrics.keys())}")
+
+            # Also populate bias metrics and distributions if not already loaded from catchments
+            if "stream_order_metrics" not in data:
+                so_bias = {}
+                for so, metrics in so_raster_metrics.items():
+                    so_bias[so] = {
+                        "n_under": int(metrics.get("n_under_predict", 0)),
+                        "n_match": int(metrics.get("n_match", 0)),
+                        "n_over": int(metrics.get("n_over_predict", 0)),
+                        "n_total": int(metrics.get("n_under_predict", 0) + metrics.get("n_match", 0) + metrics.get("n_over_predict", 0)),
+                        "area_sqkm": metrics.get("area_sqkm"),
                     }
-                data["stream_order_raster_metrics"] = so_raster_metrics
+                data["stream_order_metrics"] = so_bias
 
     return data
 
@@ -1407,6 +1407,8 @@ def main():
     parser.add_argument("--structures-source", type=str, default=None, help="URL source for structures data.")
     parser.add_argument("--catchments", type=str, default=None, help="Path to NWM catchments GeoPackage.")
     parser.add_argument("--flows", type=str, default=None, help="Path to NWM flows GeoPackage with stream order (order_ column).")
+    parser.add_argument("--so-metrics-dir", type=str, default=None,
+                        help="Directory with per-SO GVAL metrics parquets (from depth_compare.py --catchments).")
     parser.add_argument("--output", type=str, default="report.html", help="Output HTML file path.")
     parser.add_argument("--title", type=str, default="Depth Comparison Report", help="Report title.")
     parser.add_argument("--units", type=str, default="meters", choices=["meters", "feet"],
@@ -1422,6 +1424,7 @@ def main():
         agreement_map_path=args.agreement_map,
         catchments_path=args.catchments,
         flows_path=args.flows,
+        so_metrics_dir=args.so_metrics_dir,
         units=args.units,
     )
 
