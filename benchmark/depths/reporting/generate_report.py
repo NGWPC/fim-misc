@@ -170,38 +170,29 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
                 # Remove catchments with no valid pixels
                 catchments = catchments[catchments["pixel_count"] > 0].copy()
 
-                # Classify each catchment as under/match/over
-                # Using the same structure-level threshold: 0.1 ft
-                threshold = 0.1
-                catchments["bias"] = "match"
-                catchments.loc[catchments["mean_diff"] < -threshold, "bias"] = "under"
-                catchments.loc[catchments["mean_diff"] > threshold, "bias"] = "over"
-
-                # Aggregate by stream order
-                so_metrics = {}
-                for so, grp in catchments.groupby("order_"):
-                    n_total = len(grp)
-                    n_under = int((grp["bias"] == "under").sum())
-                    n_match = int((grp["bias"] == "match").sum())
-                    n_over = int((grp["bias"] == "over").sum())
-                    area_sqkm = float(grp["AreaSqKM"].sum())
-                    so_metrics[int(so)] = {
-                        "n_under": n_under,
-                        "n_match": n_match,
-                        "n_over": n_over,
-                        "n_total": n_total,
-                        "area_sqkm": area_sqkm,
-                    }
-                    print(f"  SO{so}: {n_total} catchments (under={n_under}, match={n_match}, over={n_over})")
-
-                data["stream_order_metrics"] = so_metrics
-
-                # Save per-catchment distributions and geometries keyed by stream order
+                # Save per-catchment data grouped by stream order
+                so_catchment_data = {}  # {so: {"diffs": array, "areas": array, "total_area": float}}
                 so_distributions = {}
                 so_geometries = {}
                 for so, grp in catchments.groupby("order_"):
-                    so_distributions[int(so)] = grp["mean_diff"].values
-                    so_geometries[int(so)] = grp.geometry
+                    so = int(so)
+                    so_catchment_data[so] = {
+                        "diffs": grp["mean_diff"].values,
+                        "area_sqkm": float(grp["AreaSqKM"].sum()),
+                    }
+                    so_distributions[so] = grp["mean_diff"].values
+                    so_geometries[so] = grp.geometry
+
+                # Compute bias at default threshold for logging
+                default_thresh = 0.25
+                for so in sorted(so_catchment_data.keys()):
+                    d = so_catchment_data[so]["diffs"]
+                    n_under = int(np.sum(d < -default_thresh))
+                    n_match = int(np.sum(np.abs(d) <= default_thresh))
+                    n_over = int(np.sum(d > default_thresh))
+                    print(f"  SO{so}: {len(d)} catchments (under={n_under}, match={n_match}, over={n_over})")
+
+                data["so_catchment_data"] = so_catchment_data
                 data["stream_order_distributions"] = so_distributions
                 data["stream_order_geometries"] = so_geometries
 
@@ -425,44 +416,153 @@ def render_stream_order_maps(da, so_geometries):
     return results
 
 
+_METRIC_INFO = {
+    "coefficient_of_determination": (
+        "R²",
+        "Coefficient of Determination — proportion of variance in benchmark depths explained by the candidate. "
+        "1.0 = perfect fit; 0.0 = no better than predicting the mean depth everywhere.",
+    ),
+    "mean_absolute_error": (
+        "MAE",
+        "Mean Absolute Error — average absolute difference between candidate and benchmark depths across all cells. "
+        "Lower values indicate better overall agreement.",
+    ),
+    "mean_absolute_percentage_error": (
+        "MAPE",
+        "Mean Absolute Percentage Error — average of |candidate − benchmark| / |benchmark| as a percentage. "
+        "Sensitive to cells where the benchmark depth is near zero.",
+    ),
+    "mean_normalized_mean_absolute_error": (
+        "Mean-Norm MAE",
+        "Mean-Normalized Mean Absolute Error — MAE divided by the mean benchmark depth. "
+        "Normalizes the error relative to typical flood depth in the domain.",
+    ),
+    "mean_normalized_root_mean_squared_error": (
+        "Mean-Norm RMSE",
+        "Mean-Normalized Root Mean Squared Error — RMSE divided by the mean benchmark depth. "
+        "Values less than 1 mean the typical error is smaller than the average flood depth.",
+    ),
+    "mean_percentage_error": (
+        "MPE",
+        "Mean Percentage Error — average of (candidate − benchmark) / |benchmark| as a percentage. "
+        "Positive = systematic over-prediction; negative = under-prediction.",
+    ),
+    "mean_signed_error": (
+        "Mean Signed Error",
+        "Mean Signed Error — average of (candidate − benchmark) across all cells, preserving sign. "
+        "Reveals whether the candidate systematically over- or under-predicts depth.",
+    ),
+    "mean_squared_error": (
+        "MSE",
+        "Mean Squared Error — average of squared differences between candidate and benchmark depths. "
+        "Penalizes large errors more heavily than MAE.",
+    ),
+    "range_normalized_mean_absolute_error": (
+        "Range-Norm MAE",
+        "Range-Normalized Mean Absolute Error — MAE divided by the range (max − min) of benchmark depths. "
+        "Puts the error in context of the full depth range observed.",
+    ),
+    "range_normalized_root_mean_squared_error": (
+        "Range-Norm RMSE",
+        "Range-Normalized Root Mean Squared Error — RMSE divided by the range (max − min) of benchmark depths. "
+        "Values near 0 mean errors are small relative to the full depth spread.",
+    ),
+    "root_mean_squared_error": (
+        "RMSE",
+        "Root Mean Squared Error — square root of the average squared difference between candidate and benchmark depths. "
+        "More sensitive to large outlier errors than MAE.",
+    ),
+    "symmetric_mean_absolute_percentage_error": (
+        "sMAPE",
+        "Symmetric Mean Absolute Percentage Error — treats over- and under-prediction equally. "
+        "Ranges from 0 (perfect) to 2 (maximum error).",
+    ),
+    "structures_in_domain": (
+        "Structures in Domain",
+        "Total number of building footprints that overlap the flood extent and have valid depth values in both maps.",
+    ),
+    "median_absolute_error": (
+        "Median AE",
+        "Median Absolute Error — median of absolute depth differences across structures. "
+        "Less sensitive to outliers than MAE; represents the typical structure error.",
+    ),
+    "p90_absolute_error": (
+        "P90 AE",
+        "90th Percentile Absolute Error — 90% of structures have an error at or below this value.",
+    ),
+    "max_absolute_error": (
+        "Max AE",
+        "Maximum Absolute Error — largest absolute depth difference observed at any single structure.",
+    ),
+    "n_within_1ft": ("n Within 1ft", "Count of structures where |candidate − benchmark| ≤ 1 ft."),
+    "pct_within_1ft": ("% Within 1ft", "Percentage of structures where |candidate − benchmark| ≤ 1 ft."),
+    "n_within_3ft": ("n Within 3ft", "Count of structures where |candidate − benchmark| ≤ 3 ft."),
+    "pct_within_3ft": ("% Within 3ft", "Percentage of structures where |candidate − benchmark| ≤ 3 ft."),
+    "n_within_5ft": ("n Within 5ft", "Count of structures where |candidate − benchmark| ≤ 5 ft."),
+    "pct_within_5ft": ("% Within 5ft", "Percentage of structures where |candidate − benchmark| ≤ 5 ft."),
+    "n_gt_5ft": ("n > 5ft", "Count of structures where |candidate − benchmark| > 5 ft."),
+    "pct_gt_5ft": ("% > 5ft", "Percentage of structures where |candidate − benchmark| > 5 ft."),
+    "n_over_predict": ("n Over-predict", "Count of structures where candidate depth exceeds benchmark."),
+    "pct_over_predict": ("% Over-predict", "Percentage of structures where candidate depth exceeds benchmark."),
+    "n_under_predict": ("n Under-predict", "Count of structures where candidate depth is less than benchmark."),
+    "pct_under_predict": ("% Under-predict", "Percentage of structures where candidate depth is less than benchmark."),
+    "n_match": ("n Match", "Count of structures where candidate and benchmark depths are equal (within epsilon)."),
+    "pct_match": ("% Match", "Percentage of structures where candidate and benchmark depths are equal (within epsilon)."),
+}
+
+# Convenience: acronym-only lookup
+_METRIC_ACRONYMS = {k: v[0] for k, v in _METRIC_INFO.items()}
+# Description lookup
+_METRIC_DESCRIPTIONS = {k: v[1] for k, v in _METRIC_INFO.items()}
+
+# Metrics that should display as integers
+_INTEGER_METRICS = {
+    "structures_in_domain", "n_within_1ft", "n_within_3ft", "n_within_5ft",
+    "n_gt_5ft", "n_over_predict", "n_under_predict", "n_match",
+}
+
+
 def _fmt_metric(idx, val):
     """Format a single metric value for table display."""
-    if isinstance(val, (int, np.integer)):
+    idx_str = str(idx).lower()
+    if idx_str in _INTEGER_METRICS or idx_str == "band":
+        return f"{int(val):,}"
+    elif isinstance(val, (int, np.integer)):
         return f"{val:,}"
     elif isinstance(val, (float, np.floating)):
-        if "pct" in str(idx).lower():
-            return f"{val:.1f}%"
+        if "pct" in idx_str:
+            return f"{val:.2f}%"
         else:
-            return f"{val:.4f}"
+            return f"{val:.2f}"
     return str(val)
 
 
-def make_metrics_table(metrics_df, title, extra_columns=None):
-    """Create a formatted Plotly table from a metrics DataFrame.
+def make_metrics_table(metrics_df, title, extra_columns=None, icon_svg=""):
+    """Create a formatted HTML table from a metrics DataFrame.
+
+    Returns an HTML string (not a Plotly figure).
 
     Parameters
     ----------
     extra_columns : dict, optional
         {column_label: {metric_name: value, ...}} to add as additional columns.
-        Metric names should match the index of the transposed metrics_df.
+    icon_svg : str, optional
+        SVG icon HTML to display next to the title.
     """
-    # Transpose so metrics are rows
     display = metrics_df.T.copy()
     display.columns = ["Value"]
     display.index.name = "Metric"
+    if "band" in display.index:
+        display = display.drop("band")
 
-    # Clean up metric names for display
-    labels = [idx.replace("_", " ").title() for idx in display.index]
     raw_indices = list(display.index)
-
-    # Format main "All" column
+    labels = [_METRIC_ACRONYMS.get(idx, idx.replace("_", " ").title()) for idx in raw_indices]
+    descriptions = [_METRIC_DESCRIPTIONS.get(idx, "") for idx in raw_indices]
     formatted_all = [_fmt_metric(idx, val) for idx, val in display["Value"].items()]
 
-    # Build header and cell value lists
-    header_vals = ["<b>Metric</b>", "<b>All</b>"]
-    cell_vals = [labels, formatted_all]
-    aligns = ["left", "right"]
-
+    # Extra columns (e.g. per-SO)
+    extra_headers = []
+    extra_cols = []
     if extra_columns:
         for col_label in sorted(extra_columns.keys(), key=lambda x: str(x)):
             col_data = extra_columns[col_label]
@@ -472,30 +572,48 @@ def make_metrics_table(metrics_df, title, extra_columns=None):
                     col_formatted.append(_fmt_metric(idx, col_data[idx]))
                 else:
                     col_formatted.append("—")
-            header_vals.append(f"<b>{col_label}</b>")
-            cell_vals.append(col_formatted)
-            aligns.append("right")
+            extra_headers.append(col_label)
+            extra_cols.append(col_formatted)
 
-    fig = go.Figure(data=[go.Table(
-        header=dict(
-            values=header_vals,
-            fill_color="#2a3444",
-            font=dict(color="#f0f0f0", size=13, family="Inter, sans-serif"),
-            align=aligns,
-            height=32,
-            line=dict(color="#3a3d45"),
-        ),
-        cells=dict(
-            values=cell_vals,
-            fill_color=[["#1a1d24", "#1e2128"] * (len(labels) // 2 + 1)],
-            font=dict(size=12, color="#d0d0d0", family="Inter, sans-serif"),
-            align=aligns,
-            height=28,
-            line=dict(color="#2a2d35"),
-        ),
-    )])
-    fig.update_layout(title=dict(text=title, font=dict(size=16)), margin=dict(l=20, r=20, t=50, b=20), **DARK_LAYOUT)
-    return fig
+    n_val_cols = 1 + len(extra_headers)
+
+    # Build HTML table
+    rows_html = ""
+    for i, (label, desc, val) in enumerate(zip(labels, descriptions, formatted_all)):
+        bg = "#1a1d24" if i % 2 == 0 else "#1e2128"
+        esc_desc = desc.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;") if desc else ""
+        if esc_desc:
+            metric_cell = f'<td class="has-tip" data-tip="{esc_desc}" style="background:{bg}; padding:6px 10px; text-align:left; border-bottom:1px solid #2a2d35; white-space:nowrap;">{label}</td>'
+        else:
+            metric_cell = f'<td style="background:{bg}; padding:6px 10px; text-align:left; border-bottom:1px solid #2a2d35; white-space:nowrap;">{label}</td>'
+        val_cell = f'<td style="background:{bg}; padding:6px 10px; text-align:right; border-bottom:1px solid #2a2d35;">{val}</td>'
+        extra_cells = ""
+        for col in extra_cols:
+            extra_cells += f'<td style="background:{bg}; padding:6px 10px; text-align:right; border-bottom:1px solid #2a2d35;">{col[i]}</td>'
+        rows_html += f"<tr>{metric_cell}{val_cell}{extra_cells}</tr>\n"
+
+    extra_th = "".join(f'<th style="background:#2a3444; color:#f0f0f0; padding:6px 10px; text-align:right; border-bottom:1px solid #3a3d45;">{h}</th>' for h in extra_headers)
+
+    icon_html = f'{icon_svg} ' if icon_svg else ""
+    html = f"""
+    <div style="font-family:'Proxima Nova','Inter',-apple-system,sans-serif;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+            {icon_html}<span style="color:#f0f0f0; font-size:16px; font-weight:600;">{title}</span>
+        </div>
+        <table style="width:100%; border-collapse:collapse; font-size:12px; color:#d0d0d0;">
+            <thead>
+                <tr>
+                    <th style="background:#2a3444; color:#f0f0f0; padding:6px 10px; text-align:left; border-bottom:1px solid #3a3d45;">Metric</th>
+                    <th style="background:#2a3444; color:#f0f0f0; padding:6px 10px; text-align:right; border-bottom:1px solid #3a3d45;">All</th>
+                    {extra_th}
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+    </div>"""
+    return html
 
 
 def make_agreement_histogram(values):
@@ -527,7 +645,7 @@ def make_agreement_histogram(values):
                   annotation_text=f"Median: {median_val:.2f} ft", annotation_position="top right")
 
     fig.update_layout(
-        title=dict(text="Agreement Map: Distribution of Depth Differences (Candidate - Benchmark)", font=dict(size=16)),
+        title=dict(text="", font=dict(size=1)),
         xaxis_title="Depth Difference (ft)",
         yaxis_title="Cell Count",
         xaxis_range=[-x_max, x_max],
@@ -563,7 +681,7 @@ def make_bucket_chart(structures_metrics):
     ))
 
     fig.update_layout(
-        title=dict(text="Structure Depth Agreement Buckets", font=dict(size=16)),
+        title=dict(text="", font=dict(size=1)),
         xaxis_title="Absolute Depth Difference",
         yaxis_title="Number of Structures",
         margin=dict(l=60, r=20, t=50, b=50),
@@ -725,7 +843,7 @@ def make_bias_chart(structures_metrics, area_sqkm=None):
     return _bias_bar_html("fi", _HOUSE_ICON, "Structures", n_under, n_match, n_over, total, area_sqkm)
 
 
-def make_raster_bias_chart(agreement_values, epsilon=1.0, area_sqkm=None):
+def make_raster_bias_chart(agreement_values, epsilon=0.25, area_sqkm=None):
     """Create a raster-level bias spectrum bar."""
     import numpy as np
     vals = np.asarray(agreement_values)
@@ -750,7 +868,7 @@ def make_stream_order_histograms(so_distributions):
     h_spacing = 0.04
     fig = make_subplots(
         rows=1, cols=n,
-        subplot_titles=[f"SO{so}" for so in orders],
+        subplot_titles=[""] * n,
         horizontal_spacing=h_spacing,
     )
 
@@ -814,10 +932,6 @@ def make_stream_order_histograms(so_distributions):
         font=dict(family="Proxima Nova, Inter, sans-serif", color="#e0e0e0"),
     )
 
-    # Style subplot titles
-    for annotation in fig['layout']['annotations']:
-        annotation['font'] = dict(size=13, color="#e0e0e0",
-                                   family="Proxima Nova, Inter, sans-serif")
 
     return fig, subplot_domains
 
@@ -853,7 +967,7 @@ def make_structure_boxplot(structures_gdf):
     ))
 
     fig.update_layout(
-        title=dict(text="Per-Structure Mean Depth Difference Distribution", font=dict(size=16)),
+        title=dict(text="", font=dict(size=1)),
         yaxis_title="Depth Difference (ft)",
         margin=dict(l=60, r=20, t=50, b=30),
         showlegend=False,
@@ -886,7 +1000,7 @@ def make_structure_histogram(structures_gdf):
     fig.add_vline(x=0, line_dash="dash", line_color="red", line_width=2)
 
     fig.update_layout(
-        title=dict(text="Per-Structure Mean Depth Difference Distribution", font=dict(size=16)),
+        title=dict(text="", font=dict(size=1)),
         xaxis_title="Mean Depth Difference (ft)",
         yaxis_title="Structure Count",
         xaxis_range=[-x_max, x_max],
@@ -895,6 +1009,14 @@ def make_structure_histogram(structures_gdf):
         **DARK_LAYOUT,
     )
     return fig
+
+
+def _section_title(text, icon_svg=""):
+    """Render an HTML section title with optional icon."""
+    icon_html = f'{icon_svg} ' if icon_svg else ""
+    return (f'<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">'
+            f'{icon_html}<span style="color:#f0f0f0; font-size:16px; font-weight:600; '
+            f'font-family:\'Proxima Nova\',\'Inter\',-apple-system,sans-serif;">{text}</span></div>')
 
 
 def _caption(text):
@@ -996,13 +1118,13 @@ def build_executive_summary(data, paths):
                     f"with the benchmark, with a mean absolute error of {mae:.1f} ft{r2_part}."
                 )
             elif mse_val < -1:
-                quality_html = '<b style="color:#f87171;">under-prediction</b>'
+                quality_html = '<b style="color:#7A3B50;">under-prediction</b>'
                 sentences.append(
                     f"The candidate map shows {quality_html} "
                     f"relative to the benchmark, with a mean absolute error of {mae:.1f} ft{r2_part}."
                 )
             elif mse_val > 1:
-                quality_html = '<b style="color:#60a5fa;">over-prediction</b>'
+                quality_html = '<b style="color:#2E5280;">over-prediction</b>'
                 sentences.append(
                     f"The candidate map shows {quality_html} "
                     f"relative to the benchmark, with a mean absolute error of {mae:.1f} ft{r2_part}."
@@ -1053,9 +1175,9 @@ def build_executive_summary(data, paths):
         elif pct_1ft >= 60:
             quality_word = '<b style="color:#fbbf24;">predicted with moderate accuracy</b>'
         elif intensity and bias_dir == "under":
-            quality_word = f'<b style="color:#f87171;">{intensity} under-predicted</b>'
+            quality_word = f'<b style="color:#7A3B50;">{intensity} under-predicted</b>'
         elif intensity and bias_dir == "over":
-            quality_word = f'<b style="color:#60a5fa;">{intensity} over-predicted</b>'
+            quality_word = f'<b style="color:#2E5280;">{intensity} over-predicted</b>'
         elif pct_1ft >= 40:
             quality_word = '<b style="color:#fb923c;">predicted with weak accuracy</b>'
         else:
@@ -1108,14 +1230,205 @@ def build_html(data, title, paths=None, offline=True):
 
     # Key takeaways + spectrum chart at the top; run details go to the bottom
     takeaway_html, details_html = build_executive_summary(data, paths)
-    bias_charts = ""
+    # --- Interactive bias spectrum bars with threshold toggle ---
+    import json as _json
+
+    class _NpEncoder(_json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
+    thresholds = [0.25, 0.5, 1.0, 2.0, 3.0]
+    default_thresh = 0.25
+
+    # Pre-compute bias counts at every threshold for each bar
+    bias_data = {}  # {bar_id: {thresh: {n_under, n_match, n_over, total, area}}}
+
+    def _safe_area(v):
+        return float(v) if v is not None else None
+
     if "agreement_values" in data:
-        bias_charts += make_raster_bias_chart(data["agreement_values"], area_sqkm=data.get("raster_area_sqkm"))
-    if "structures_metrics" in data:
-        bias_charts += make_bias_chart(data["structures_metrics"], area_sqkm=data.get("structures_area_sqkm"))
-    if "stream_order_metrics" in data:
-        bias_charts += make_stream_order_bias_charts(data["stream_order_metrics"])
-    sections.append(takeaway_html.replace("__BIAS_CHART__", bias_charts))
+        vals = np.asarray(data["agreement_values"])
+        area = _safe_area(data.get("raster_area_sqkm"))
+        for t in thresholds:
+            n_u = int(np.sum(vals < -t))
+            n_m = int(np.sum(np.abs(vals) <= t))
+            n_o = int(np.sum(vals > t))
+            bias_data.setdefault("raster", {})[str(t)] = {
+                "n_under": n_u, "n_match": n_m, "n_over": n_o,
+                "total": n_u + n_m + n_o, "area": area,
+            }
+
+    if "structures_gdf" in data:
+        diffs = data["structures_gdf"]["mean_depth_diff"].values
+        area = _safe_area(data.get("structures_area_sqkm"))
+        for t in thresholds:
+            n_u = int(np.sum(diffs < -t))
+            n_m = int(np.sum(np.abs(diffs) <= t))
+            n_o = int(np.sum(diffs > t))
+            bias_data.setdefault("structures", {})[str(t)] = {
+                "n_under": n_u, "n_match": n_m, "n_over": n_o,
+                "total": n_u + n_m + n_o, "area": area,
+            }
+
+    if "so_catchment_data" in data:
+        for so, sdata in sorted(data["so_catchment_data"].items()):
+            d = sdata["diffs"]
+            area = float(sdata["area_sqkm"])
+            bar_id = f"so{so}"
+            for t in thresholds:
+                n_u = int(np.sum(d < -t))
+                n_m = int(np.sum(np.abs(d) <= t))
+                n_o = int(np.sum(d > t))
+                bias_data.setdefault(bar_id, {})[str(t)] = {
+                    "n_under": n_u, "n_match": n_m, "n_over": n_o,
+                    "total": n_u + n_m + n_o, "area": area,
+                }
+
+    # Build static HTML bars (default threshold) with data-id attributes for JS targeting
+    def _interactive_bar(bar_id, icon_svg, label, counts):
+        """Render a single bar at default threshold with JS-targetable elements."""
+        n_u, n_m, n_o = counts["n_under"], counts["n_match"], counts["n_over"]
+        total = counts["total"]
+        area = counts.get("area")
+        pct_u = n_u / total * 100 if total else 0
+        pct_m = n_m / total * 100 if total else 0
+        pct_o = n_o / total * 100 if total else 0
+        min_w = 2.0
+        ws = [max(pct_u, min_w), max(pct_m, min_w), max(pct_o, min_w)]
+        sc = 100.0 / sum(ws)
+        w_u, w_m, w_o = ws[0]*sc, ws[1]*sc, ws[2]*sc
+        area_str = _fmt_area(area) if area else ""
+        if area and total:
+            a_u, a_m, a_o = area*n_u/total, area*n_m/total, area*n_o/total
+            tip_u = f"Under-prediction: {pct_u:.1f}%&#10;Count: {n_u:,}&#10;Area: {_fmt_area(a_u)}"
+            tip_m = f"Match: {pct_m:.1f}%&#10;Count: {n_m:,}&#10;Area: {_fmt_area(a_m)}"
+            tip_o = f"Over-prediction: {pct_o:.1f}%&#10;Count: {n_o:,}&#10;Area: {_fmt_area(a_o)}"
+        else:
+            tip_u = f"Under-prediction: {pct_u:.1f}%&#10;Count: {n_u:,}"
+            tip_m = f"Match: {pct_m:.1f}%&#10;Count: {n_m:,}"
+            tip_o = f"Over-prediction: {pct_o:.1f}%&#10;Count: {n_o:,}"
+        return f"""
+        <div data-bias-bar="{bar_id}" style="padding:6px 0; font-family:'Proxima Nova','Inter',-apple-system,sans-serif;">
+          <div style="display:flex; align-items:center;">
+            <div style="width:110px; flex-shrink:0; display:flex; align-items:center; gap:6px;">
+              {icon_svg}
+              <span style="color:#e0e0e0; font-size:12px; font-weight:500; white-space:nowrap;">{label}</span>
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div style="position:relative; height:11px; border-radius:6px; overflow:hidden; display:flex;">
+                <div data-seg="under" title="{tip_u}" style="height:100%; background:#7A3B50; width:{w_u:.2f}%; border-radius:6px 0 0 6px; cursor:default;"></div>
+                <div data-seg="match" title="{tip_m}" style="height:100%; background:#E8D8D0; width:{w_m:.2f}%; cursor:default;"></div>
+                <div data-seg="over" title="{tip_o}" style="height:100%; background:#2E5280; width:{w_o:.2f}%; border-radius:0 6px 6px 0; cursor:default;"></div>
+              </div>
+            </div>
+            <div style="width:160px; flex-shrink:0; text-align:right; white-space:nowrap;">
+              <span data-stat="n" style="color:#6a6d75; font-size:10px;">n={total:,}</span>
+              {"" if not area_str else f'<span style="color:#4a4d55; font-size:10px; margin:0 4px;">|</span><span style="color:#6a6d75; font-size:10px;">{area_str}</span>'}
+            </div>
+          </div>
+        </div>"""
+
+    bars_html = ""
+    default_key = str(default_thresh)
+    if "raster" in bias_data:
+        bars_html += _interactive_bar("raster", _GRID_ICON, "All Pixels", bias_data["raster"][default_key])
+    if "structures" in bias_data:
+        bars_html += _interactive_bar("structures", _HOUSE_ICON, "Structures", bias_data["structures"][default_key])
+    for bar_id in sorted(k for k in bias_data if k.startswith("so")):
+        so_num = bar_id[2:]
+        bars_html += _interactive_bar(bar_id, _WAVE_ICON, f"SO{so_num}", bias_data[bar_id][default_key])
+
+    # Toggle buttons
+    toggle_html = '<div style="display:flex; align-items:center; gap:6px; margin-bottom:8px;">'
+    toggle_html += '<span style="color:#6a6d75; font-size:11px; font-weight:400;">Match threshold:</span>'
+    for t in thresholds:
+        active = "background:#2E5280; color:#fff;" if t == default_thresh else "background:#1e2128; color:#8a8d94;"
+        toggle_html += (
+            f'<button onclick="setBiasThreshold({t})" data-thresh="{t}" '
+            f'style="{active} border:1px solid #3a3d45; border-radius:4px; padding:3px 10px; '
+            f'font-size:11px; font-family:inherit; cursor:pointer;">±{t}ft</button>'
+        )
+    toggle_html += '</div>'
+
+    # Legend (threshold value updated by JS)
+    legend_html = (
+        '<p id="bias-legend" class="caption">'
+        f'<span style="color:#7A3B50; font-weight:600;">Under-prediction</span> '
+        f'= candidate depth &lt; benchmark by &gt;{default_thresh} ft &nbsp;·&nbsp; '
+        f'<span style="color:#E8D8D0; font-weight:600;">Match</span> '
+        f'= within ±{default_thresh} ft &nbsp;·&nbsp; '
+        f'<span style="color:#2E5280; font-weight:600;">Over-prediction</span> '
+        f'= candidate depth &gt; benchmark by &gt;{default_thresh} ft</p>'
+    )
+
+    # JS for interactive updates
+    bias_js = f"""
+    <script>
+    var biasData = {_json.dumps(bias_data, cls=_NpEncoder)};
+    function fmtArea(a) {{
+        if (a === null || a === undefined) return "";
+        if (a < 1) return (a * 1e6).toFixed(0).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ",") + " m²";
+        return a.toFixed(1).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ",") + " km²";
+    }}
+    function fmtN(n) {{ return n.toString().replace(/\\B(?=(\\d{{3}})+(?!\\d))/g, ","); }}
+    function setBiasThreshold(t) {{
+        var key = t % 1 === 0 ? t.toFixed(1) : String(t);
+        document.querySelectorAll('[data-thresh]').forEach(function(btn) {{
+            if (parseFloat(btn.dataset.thresh) === t) {{
+                btn.style.background = '#2E5280'; btn.style.color = '#fff';
+            }} else {{
+                btn.style.background = '#1e2128'; btn.style.color = '#8a8d94';
+            }}
+        }});
+        document.querySelectorAll('[data-bias-bar]').forEach(function(bar) {{
+            var id = bar.dataset.biasBar;
+            if (!biasData[id] || !biasData[id][key]) return;
+            var d = biasData[id][key];
+            var total = d.total;
+            if (total === 0) return;
+            var pU = d.n_under / total * 100;
+            var pM = d.n_match / total * 100;
+            var pO = d.n_over / total * 100;
+            var minW = 2.0;
+            var ws = [Math.max(pU, minW), Math.max(pM, minW), Math.max(pO, minW)];
+            var sc = 100.0 / (ws[0] + ws[1] + ws[2]);
+            var segs = bar.querySelectorAll('[data-seg]');
+            segs.forEach(function(seg) {{
+                var s = seg.dataset.seg;
+                var w, pct, n, tipLabel;
+                if (s === 'under') {{ w = ws[0]*sc; pct = pU; n = d.n_under; tipLabel = 'Under-prediction'; }}
+                else if (s === 'match') {{ w = ws[1]*sc; pct = pM; n = d.n_match; tipLabel = 'Match'; }}
+                else {{ w = ws[2]*sc; pct = pO; n = d.n_over; tipLabel = 'Over-prediction'; }}
+                seg.style.width = w.toFixed(2) + '%';
+                var tip = tipLabel + ': ' + pct.toFixed(1) + '%\\nCount: ' + fmtN(n);
+                if (d.area !== null && d.area !== undefined) {{
+                    tip += '\\nArea: ' + fmtArea(d.area * n / total);
+                }}
+                seg.title = tip;
+            }});
+        }});
+        var legend = document.getElementById('bias-legend');
+        if (legend) {{
+            legend.innerHTML =
+                '<span style="color:#7A3B50; font-weight:600;">Under-prediction</span> ' +
+                '= candidate depth &lt; benchmark by &gt;' + t + ' ft &nbsp;·&nbsp; ' +
+                '<span style="color:#E8D8D0; font-weight:600;">Match</span> ' +
+                '= within ±' + t + ' ft &nbsp;·&nbsp; ' +
+                '<span style="color:#2E5280; font-weight:600;">Over-prediction</span> ' +
+                '= candidate depth &gt; benchmark by &gt;' + t + ' ft';
+        }}
+    }}
+    </script>
+    """
+
+    bias_block = toggle_html + bars_html + legend_html + bias_js
+    sections.append(takeaway_html.replace("__BIAS_CHART__", bias_block))
 
     # Agreement map image
     if "agreement_da" in data:
@@ -1124,36 +1437,24 @@ def build_html(data, title, paths=None, offline=True):
         <div class="chart-container" style="text-align:center;">
             <img src="data:image/png;base64,{b64}" style="max-width:100%; height:auto; border-radius:4px;" />
             {_caption('Map of depth differences between the candidate and benchmark maps.'
-                      '<span style="color:#e74c3c;">Red areas</span> indicate the candidate under-predicts depth; '
-                      '<span style="color:#60a5fa;">blue areas</span> indicate over-prediction. '
+                      '<span style="color:#7A3B50;">Red areas</span> indicate the candidate under-predicts depth; '
+                      '<span style="color:#2E5280;">blue areas</span> indicate over-prediction. '
                       'Transparent regions had no flooding in either map.')}
         </div>
         """)
 
-    # Raster metrics table (with per-SO columns if available)
-    if "depth_metrics" in data:
-        so_extra = None
-        if "stream_order_raster_metrics" in data:
-            so_extra = {f"SO{so}": metrics
-                        for so, metrics in data["stream_order_raster_metrics"].items()}
-        fig = make_metrics_table(data["depth_metrics"], "Raster Depth Metrics",
-                                  extra_columns=so_extra)
-        h = max(400, len(data["depth_metrics"].columns) * 30 + 80)
-        fig.update_layout(height=h)
-        sections.append(f"""<div class="chart-container">
-            {fig.to_html(full_html=False, include_plotlyjs=False)}
-            {_caption("Cell-level error metrics computed across all raster cells where either map shows flooding. "
-                      "Lower MAE and RMSE indicate better agreement; R² closer to 1.0 indicates stronger correlation.")}
-        </div>""")
-
-    # Agreement map histogram
+    # Agreement histogram (full width)
     if "agreement_values" in data:
-        fig = make_agreement_histogram(data["agreement_values"])
-        fig.update_layout(height=400)
+        hist_fig = make_agreement_histogram(data["agreement_values"])
+        hist_fig.update_layout(height=450)
         sections.append(f"""<div class="chart-container">
-            {fig.to_html(full_html=False, include_plotlyjs=False)}
+            {_section_title("Depth Difference Distribution", _GRID_ICON)}
+            {hist_fig.to_html(full_html=False, include_plotlyjs=False)}
             {_caption('Distribution of per-cell depth differences. Values near zero indicate agreement. '
-                      'A left-skewed distribution means the candidate generally under-predicts; right-skewed means over-prediction. '
+                      'A left-skewed distribution means the candidate generally '
+                      '<span style="color:#7A3B50; font-weight:500;">under-predicts</span>; '
+                      'right-skewed means '
+                      '<span style="color:#2E5280; font-weight:500;">over-prediction</span>. '
                       'The <span style="color:#e74c3c;">dashed red line</span> marks zero difference; '
                       'the <span style="color:#e67e22;">dotted orange line</span> marks the median.')}
         </div>""")
@@ -1202,10 +1503,10 @@ def build_html(data, title, paths=None, offline=True):
 
             grid_cols = " ".join(col_parts)
 
-            # Build cells (with empty spacers for gaps)
+            # Build cells: title labels, maps, arrows (with empty spacers for gaps)
+            title_cells = ""
             map_cells = ""
             arrow_cells = ""
-            cell_idx = 0
             prev_right = 0.0
             for idx, so in enumerate(so_orders):
                 if idx >= len(subplot_domains):
@@ -1213,9 +1514,15 @@ def build_html(data, title, paths=None, offline=True):
                 dl, dr = subplot_domains[idx]
                 gap = dl - prev_right
                 if gap > 0.001:
+                    title_cells += '<div></div>'
                     map_cells += '<div></div>'
                     arrow_cells += '<div></div>'
 
+                title_cells += (
+                    f'<div style="text-align:center; display:flex; align-items:center; justify-content:center; gap:4px;">'
+                    f'{_WAVE_ICON}<span style="color:#e0e0e0; font-size:13px; font-weight:600; '
+                    f'font-family:\'Proxima Nova\',\'Inter\',sans-serif;">SO{so}</span></div>'
+                )
                 if so in so_maps:
                     map_cells += (
                         f'<div style="text-align:center;">'
@@ -1230,6 +1537,9 @@ def build_html(data, title, paths=None, offline=True):
 
             # Plotly margins: l=50px, r=20px — apply as padding on the grid container
             sections.append(f"""<div class="chart-container" style="padding-bottom:0; margin-bottom:0;">
+                <div style="display:grid; grid-template-columns:{grid_cols}; padding:0 20px 0 50px; margin-bottom:6px;">
+                    {title_cells}
+                </div>
                 <div style="display:grid; grid-template-columns:{grid_cols}; padding:0 20px 0 50px;">
                     {map_cells}
                 </div>
@@ -1244,42 +1554,41 @@ def build_html(data, title, paths=None, offline=True):
                 {_caption('Per-catchment mean depth difference distributions by stream order. '
                           'The <span style="color:#e74c3c;">dashed red line</span> marks zero; '
                           'the <span style="color:#e67e22;">dotted orange line</span> marks the median. '
-                          'Distributions shifted right indicate over-prediction; left indicates under-prediction.')}
+                          'Distributions shifted right indicate '
+                          '<span style="color:#2E5280; font-weight:500;">over-prediction</span>; '
+                          'left indicates '
+                          '<span style="color:#7A3B50; font-weight:500;">under-prediction</span>.')}
             </div>""")
 
-    # Structure metrics table
-    if "structures_metrics" in data:
-        fig = make_metrics_table(data["structures_metrics"], "Structure Depth Metrics")
-        h = max(400, len(data["structures_metrics"].columns) * 30 + 80)
-        fig.update_layout(height=h)
-        sections.append(f"""<div class="chart-container">
-            {fig.to_html(full_html=False, include_plotlyjs=False)}
-            {_caption("Summary metrics for building footprints within the flood domain. "
-                      "Agreement buckets show what fraction of structures have depth predictions within 1, 3, or 5 feet of the benchmark.")}
-        </div>""")
-
-    # Bucket chart
+    # Structure charts — bucket chart + per-structure histogram side by side
     if "structures_metrics" in data:
         bucket_fig = make_bucket_chart(data["structures_metrics"])
-        bucket_fig.update_layout(height=420)
-        sections.append(f"""<div class="chart-container">
+        bucket_fig.update_layout(height=450)
+        bucket_html = f"""{_section_title("Agreement Buckets", _HOUSE_ICON)}
             {bucket_fig.to_html(full_html=False, include_plotlyjs=False)}
-            {_caption('Number of structures in each depth agreement bucket. '
-                      '<span style="color:#27ae60;">Green bars</span> indicate close agreement; '
-                      '<span style="color:#e74c3c;">red bars</span> indicate large discrepancies. '
-                      'A good candidate model will concentrate structures in the leftmost bars.')}
-        </div>""")
+            {_caption('Structures in each depth agreement bucket. '
+                      '<span style="color:#27ae60;">Green</span> = close agreement; '
+                      'lighter = larger discrepancy.')}"""
 
-    # Per-structure histogram
-    if "structures_gdf" in data:
-        hist_fig = make_structure_histogram(data["structures_gdf"])
-        hist_fig.update_layout(height=420)
-        sections.append(f"""<div class="chart-container">
-            {hist_fig.to_html(full_html=False, include_plotlyjs=False)}
-            {_caption('Histogram of mean depth difference per structure. Negative values mean the candidate predicts less flooding '
-                      'than the benchmark at that building; positive values mean more. '
-                      'A tight cluster around the <span style="color:#e74c3c;">dashed red zero line</span> is ideal.')}
-        </div>""")
+        hist_html_struct = ""
+        if "structures_gdf" in data:
+            hist_fig = make_structure_histogram(data["structures_gdf"])
+            hist_fig.update_layout(height=450)
+            hist_html_struct = f"""{_section_title("Depth Diff Distribution", _HOUSE_ICON)}
+                {hist_fig.to_html(full_html=False, include_plotlyjs=False)}
+                {_caption('Per-structure mean depth difference. '
+                          '<span style="color:#7A3B50; font-weight:500;">Left</span> = '
+                          'under-prediction; '
+                          '<span style="color:#2E5280; font-weight:500;">right</span> = '
+                          'over-prediction.')}"""
+
+        if hist_html_struct:
+            sections.append(f"""<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+                <div class="chart-container">{bucket_html}</div>
+                <div class="chart-container">{hist_html_struct}</div>
+            </div>""")
+        else:
+            sections.append(f"""<div class="chart-container">{bucket_html}</div>""")
 
     # (Bias direction donut is shown at the top alongside the summary)
 
@@ -1290,6 +1599,33 @@ def build_html(data, title, paths=None, offline=True):
     #     sections.append(f"""<div class="chart-container">
     #         {box_fig.to_html(full_html=False, include_plotlyjs=False)}
     #     </div>""")
+
+    # Metrics tables — raster (left) + structure (right) side by side
+    raster_table_html = ""
+    struct_table_html = ""
+    if "depth_metrics" in data:
+        so_extra = None
+        if "stream_order_raster_metrics" in data:
+            so_extra = {f"SO{so}": metrics
+                        for so, metrics in data["stream_order_raster_metrics"].items()}
+        raster_table_html = make_metrics_table(data["depth_metrics"], "Raster Depth Metrics",
+                                                extra_columns=so_extra, icon_svg=_GRID_ICON)
+        raster_table_html += _caption("Cell-level error metrics computed across all raster cells where either map shows flooding. "
+                                       "Lower MAE and RMSE indicate better agreement; R² closer to 1.0 indicates stronger correlation.")
+    if "structures_metrics" in data:
+        struct_table_html = make_metrics_table(data["structures_metrics"], "Structure Depth Metrics",
+                                               icon_svg=_HOUSE_ICON)
+        struct_table_html += _caption("Summary metrics for building footprints within the flood domain.")
+
+    if raster_table_html and struct_table_html:
+        sections.append(f"""<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+            <div class="chart-container">{raster_table_html}</div>
+            <div class="chart-container">{struct_table_html}</div>
+        </div>""")
+    elif raster_table_html:
+        sections.append(f"""<div class="chart-container">{raster_table_html}</div>""")
+    elif struct_table_html:
+        sections.append(f"""<div class="chart-container">{struct_table_html}</div>""")
 
     # Run details bullet list at the very bottom
     sections.append(details_html)
@@ -1322,6 +1658,33 @@ def build_html(data, title, paths=None, offline=True):
             padding: 16px;
             margin-bottom: 16px;
             
+        }}
+        .has-tip {{
+            position: relative;
+            cursor: default;
+            text-decoration: underline dotted #4a4d55;
+            text-underline-offset: 3px;
+        }}
+        .has-tip:hover::after {{
+            content: attr(data-tip);
+            position: absolute;
+            left: 0;
+            top: 100%;
+            z-index: 999;
+            background: #2a3444;
+            color: #e0e0e0;
+            border: 1px solid #3a3d45;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 400;
+            line-height: 1.5;
+            white-space: normal;
+            width: 320px;
+            max-width: 90vw;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            pointer-events: none;
+            margin-top: 4px;
         }}
         .caption {{
             color: #8a8d94;
