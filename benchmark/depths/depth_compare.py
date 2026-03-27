@@ -7,6 +7,8 @@ python depth_compare.py \
     --benchmark-map data/benchmark_ble_huc_12090301_depth_500yr.tif \
     --agreement-map data/agreement_dummy_ble_huc_12090301_depth_500yr.tif \
     --metrics-parquet data/depth_metrics_huc_12090301_depth_500yr.parquet \
+    --structures data/structures.gdb \
+    --structures-metrics-parquet data/structures_metrics.parquet \
     --num-workers 6
     --epsilon 0.1
 """
@@ -20,17 +22,22 @@ import gc
 
 import pyproj
 
-# Set PROJ and GDAL data paths for odc-geo
-os.environ["PROJ_LIB"] = os.path.join(sys.prefix, "share", "proj")
-os.environ["GDAL_DATA"] = os.path.join(sys.prefix, "share", "gdal")
+# Set PROJ and GDAL data paths for odc-geo (only if they exist)
+_proj_lib = os.path.join(sys.prefix, "share", "proj")
+_gdal_data = os.path.join(sys.prefix, "share", "gdal")
+if os.path.isdir(_proj_lib):
+    os.environ["PROJ_LIB"] = _proj_lib
+    pyproj.datadir.set_data_dir(_proj_lib)
+if os.path.isdir(_gdal_data):
+    os.environ["GDAL_DATA"] = _gdal_data
 
-# Ensure pyproj uses the correct PROJ data directory
-pyproj.datadir.set_data_dir(os.environ["PROJ_LIB"])
-
+import numpy as np
+import pandas as pd
 import rioxarray as rxr
 import dask
 import gval
 import geopandas as gpd
+from exactextract import exact_extract
 from gval.comparison.pairing_functions import difference
 from gval.comparison.compute_continuous_metrics import _compute_continuous_metrics
 
@@ -114,6 +121,23 @@ def compare_depth_maps(
             resampling=resampling,
         )
 
+        # Preserve CRS from benchmark for later use (as WKT to avoid reference invalidation)
+        crs = da_benchmark.rio.crs.to_wkt()
+
+        # Define "wet" as depth > 0 (not just notnull), so that candidate cells
+        # with value 0 (dry within its extent) don't create false domain overlap
+        # with benchmark nodata areas.
+        #
+        # The comparison domain is where at least one map has depth > 0.
+        # Within that domain, dry cells are filled with 0 so both over- and
+        # under-prediction are captured. Areas where both maps are dry or
+        # nodata are excluded entirely.
+        benchmark_wet = (da_benchmark > 0) & da_benchmark.notnull()
+        candidate_wet = (da_candidate > 0) & da_candidate.notnull()
+        either_wet = benchmark_wet | candidate_wet
+        da_candidate = da_candidate.where(candidate_wet, other=0.0).where(either_wet)
+        da_benchmark = da_benchmark.where(benchmark_wet, other=0.0).where(either_wet)
+
         # Compute agreement map
         results = da_candidate.gval.compute_agreement_map(
             benchmark_map=da_benchmark,
@@ -146,13 +170,12 @@ def compare_depth_maps(
 
     # Save agreement map if path provided
     if agreement_map_path is not None:
+        agreement_map = agreement_map.rio.write_crs(crs)
         agreement_map.rio.to_raster(
             agreement_map_path,
             driver="COG",
             tiled=True,
             compress="LZW",
-            blockxsize=da_candidate.chunks[1][0],
-            blockysize=da_candidate.chunks[0][0],
             dtype="float32",
             BIGTIFF="IF_SAFER",
         )
@@ -162,6 +185,169 @@ def compare_depth_maps(
         metrics_table.to_parquet(metrics_parquet_path, engine="pyarrow", index=False, compression="snappy")
 
     return agreement_map, metrics_table
+
+def compare_structures(
+    agreement_map,
+    structures_path: str | os.PathLike,
+    structures_metrics_parquet_path: str | os.PathLike | None = None,
+    structures_gpkg_path: str | os.PathLike | None = None,
+    units: str = "feet",
+):
+    """
+    Summarize the agreement map at building footprint locations.
+
+    Reprojects the agreement map to WGS84, polygonizes and simplifies the
+    valid-data domain, then uses the simplified polygon as a mask to load
+    only structures intersecting the flood domain. Runs zonal statistics of
+    the agreement map on those structures and computes summary metrics
+    including depth agreement buckets and bias direction.
+
+    Parameters
+    ----------
+    agreement_map : xr.DataArray
+        Agreement map (candidate - benchmark depth difference) as returned
+        by compare_depth_maps.
+    structures_path : str or os.PathLike
+        Path to structures vector file (e.g. GDB, GPKG, shapefile).
+    structures_metrics_parquet_path : str or os.PathLike, default = None
+        Path to save summary metrics parquet. If None, not saved.
+    structures_gpkg_path : str or os.PathLike, default = None
+        Path to save per-structure results as GeoPackage with geometry
+        and categorical columns for symbolization. If None, not saved.
+
+    Returns
+    -------
+    Tuple[gpd.GeoDataFrame, pd.DataFrame]
+        Per-structure results GeoDataFrame and summary metrics DataFrame.
+    """
+    from rasterio.features import shapes
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    # Compute into memory if needed
+    if hasattr(agreement_map, "compute"):
+        agreement_map = agreement_map.compute()
+
+    # --- Reproject agreement map to WGS84 (to match structures natively) ---
+    print("Reprojecting agreement map to EPSG:4326...")
+    agreement_map_wgs84 = agreement_map.rio.reproject("EPSG:4326")
+
+    # --- Polygonize, simplify, and buffer the agreement domain ---
+    print("Polygonizing agreement domain...")
+    valid_mask = agreement_map_wgs84.notnull().values.astype(np.uint8)
+    transform = agreement_map_wgs84.rio.transform()
+    domain_polys = [
+        shape(geom) for geom, val in shapes(valid_mask, mask=valid_mask == 1, transform=transform)
+        if val == 1
+    ]
+    if not domain_polys:
+        print("No valid cells in agreement map — no structures to compare.")
+        return gpd.GeoDataFrame(), pd.DataFrame()
+    domain_polygon = unary_union(domain_polys)
+    res = abs(transform.a)
+    domain_simple = domain_polygon.simplify(res * 2).buffer(res * 3)
+    print(f"Agreement domain polygonized and simplified: {len(domain_polys)} polygon(s) merged.")
+
+    # --- Load only structures intersecting the buffered domain ---
+    print("Loading structures within buffered domain...")
+    domain_mask = gpd.GeoDataFrame(geometry=[domain_simple], crs="EPSG:4326")
+    domain_structures = gpd.read_file(structures_path, mask=domain_mask)
+    if len(domain_structures) == 0:
+        print("No structures found within agreement domain.")
+        return gpd.GeoDataFrame(), pd.DataFrame()
+    print(f"Loaded {len(domain_structures)} structures within agreement domain.")
+
+    # --- Zonal stats: summarize agreement map at domain structures ---
+    print("Running zonal stats...")
+    stats = exact_extract(
+        agreement_map_wgs84, domain_structures, ["mean", "min", "max", "count"], include_cols=[], output="pandas",
+    )
+
+    domain_structures = domain_structures.copy()
+    domain_structures["mean_depth_diff"] = stats["mean"].fillna(0.0)
+    domain_structures["min_depth_diff"] = stats["min"].fillna(0.0)
+    domain_structures["max_depth_diff"] = stats["max"].fillna(0.0)
+    domain_structures["pixel_count"] = stats["count"]
+
+    # Keep structures with raster coverage
+    domain_structures = domain_structures[domain_structures["pixel_count"] > 0].copy()
+    print(f"{len(domain_structures)} structures have agreement map coverage.")
+
+    diff = domain_structures["mean_depth_diff"].values
+    abs_diff = np.abs(diff)
+    n_domain_valid = len(domain_structures)
+
+    # --- Per-structure categorical columns (for GPKG symbolization) ---
+    # Thresholds in feet; convert if input units are meters
+    ft_scale = 0.3048 if units == "meters" else 1.0
+    buckets = pd.cut(
+        abs_diff,
+        bins=[0, 1 * ft_scale, 3 * ft_scale, 5 * ft_scale, np.inf],
+        labels=["< 1ft", "1-3ft", "3-5ft", "> 5ft"],
+        include_lowest=True,
+    )
+    domain_structures["agreement_bucket"] = buckets.astype(str)
+    domain_structures["bias_direction"] = np.where(
+        diff > ft_scale * 0.1, "over",
+        np.where(diff < -ft_scale * 0.1, "under", "match"),
+    )
+
+    # --- Summary metrics ---
+    mae_d = float(np.mean(abs_diff))
+    mse_d = float(np.mean(diff ** 2))
+    rmse_d = float(np.sqrt(mse_d))
+    mean_signed_d = float(np.mean(diff))
+    median_ae = float(np.median(abs_diff))
+    p90_ae = float(np.percentile(abs_diff, 90))
+    max_ae = float(np.max(abs_diff))
+
+    # Bucket counts and percentages
+    n_within_1ft = int(np.sum(abs_diff < 1 * ft_scale))
+    n_within_3ft = int(np.sum(abs_diff < 3 * ft_scale))
+    n_within_5ft = int(np.sum(abs_diff < 5 * ft_scale))
+    n_gt_5ft = int(np.sum(abs_diff >= 5 * ft_scale))
+
+    # Bias direction counts
+    n_over = int(np.sum(diff > ft_scale * 0.1))
+    n_under = int(np.sum(diff < -ft_scale * 0.1))
+    n_match = n_domain_valid - n_over - n_under
+
+    summary = pd.DataFrame({
+        "structures_in_domain": [n_domain_valid],
+        "mean_absolute_error": [mae_d],
+        "root_mean_squared_error": [rmse_d],
+        "mean_squared_error": [mse_d],
+        "mean_signed_error": [mean_signed_d],
+        "median_absolute_error": [median_ae],
+        "p90_absolute_error": [p90_ae],
+        "max_absolute_error": [max_ae],
+        "n_within_1ft": [n_within_1ft],
+        "pct_within_1ft": [n_within_1ft / n_domain_valid * 100],
+        "n_within_3ft": [n_within_3ft],
+        "pct_within_3ft": [n_within_3ft / n_domain_valid * 100],
+        "n_within_5ft": [n_within_5ft],
+        "pct_within_5ft": [n_within_5ft / n_domain_valid * 100],
+        "n_gt_5ft": [n_gt_5ft],
+        "pct_gt_5ft": [n_gt_5ft / n_domain_valid * 100],
+        "n_over_predict": [n_over],
+        "pct_over_predict": [n_over / n_domain_valid * 100],
+        "n_under_predict": [n_under],
+        "pct_under_predict": [n_under / n_domain_valid * 100],
+        "n_match": [n_match],
+        "pct_match": [n_match / n_domain_valid * 100],
+    })
+
+    print(f"\nDomain structures with coverage: {n_domain_valid}")
+
+    if structures_metrics_parquet_path is not None:
+        summary.to_parquet(structures_metrics_parquet_path, engine="pyarrow", index=False, compression="snappy")
+
+    if structures_gpkg_path is not None:
+        domain_structures.to_file(structures_gpkg_path, driver="GPKG", layer="structures")
+        print(f"Saved {len(domain_structures)} domain structures to {structures_gpkg_path}")
+
+    return domain_structures, summary
+
 
 def main():
     parser = argparse.ArgumentParser(description="Compare candidate depth map against benchmark depth map.")
@@ -180,6 +366,11 @@ def main():
     parser.add_argument("--keep-memory", action="store_false", help="Whether to keep not force garbage collection after computation.")
     parser.add_argument("--epsilon", type=float, default=0.1, help="Small value to avoid division by zero in some metrics.")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of Dask workers.")
+    parser.add_argument("--structures", type=str, default=None, help="Path to structures vector file (GDB, GPKG, shapefile).")
+    parser.add_argument("--structures-metrics-parquet", type=str, default=None, help="Path to save structures metrics parquet file.")
+    parser.add_argument("--structures-gpkg", type=str, default=None, help="Path to save per-structure results as GeoPackage (includes geometry + metrics).")
+    parser.add_argument("--units", type=str, default="feet", choices=["meters", "feet"],
+                        help="Units of the input rasters. Affects bucket thresholds (default: feet).")
 
     args = parser.parse_args()
 
@@ -211,6 +402,19 @@ def main():
 
     print("Metric Table:")
     print(metric_table.T)
+
+    # Compare structures if provided
+    if args.structures is not None:
+        structures_gdf, structures_summary = compare_structures(
+            agreement_map,
+            args.structures,
+            structures_metrics_parquet_path=args.structures_metrics_parquet,
+            structures_gpkg_path=args.structures_gpkg,
+            units=args.units,
+        )
+
+        print("\nStructures Metrics:")
+        print(structures_summary.T)
 
 if __name__ == "__main__":
     main()
