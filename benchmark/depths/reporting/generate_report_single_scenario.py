@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 
 import base64
@@ -56,7 +57,7 @@ _DEPTH_METRIC_COLS = {
 
 def load_data(depth_metrics_path, structures_metrics_path=None,
               structures_gpkg_path=None, agreement_map_path=None,
-              catchments_path=None, flows_path=None,
+              catchments_path=None,
               so_metrics_dir=None,
               units="meters"):
     """Load all input data files, optionally converting depth values from meters to feet."""
@@ -65,6 +66,7 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
     scale = M_TO_FT if convert else 1.0
     scale_sq = M_TO_FT ** 2 if convert else 1.0
 
+    t0 = time.time()
     dm = pd.read_parquet(depth_metrics_path)
     if convert:
         for col in dm.columns:
@@ -75,8 +77,10 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
                     dm[col] = dm[col] * scale
     dm = dm.drop(columns=["band"], errors="ignore")
     data["depth_metrics"] = dm
+    print(f"  Depth metrics loaded in {time.time() - t0:.2f}s")
 
     if structures_metrics_path and os.path.exists(structures_metrics_path):
+        t0 = time.time()
         sm = pd.read_parquet(structures_metrics_path)
         if convert:
             for col in sm.columns:
@@ -86,8 +90,10 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
                     else:
                         sm[col] = sm[col] * scale
         data["structures_metrics"] = sm
+        print(f"  Structures metrics loaded in {time.time() - t0:.2f}s")
 
     if structures_gpkg_path and os.path.exists(structures_gpkg_path):
+        t0 = time.time()
         import geopandas as gpd
         gdf = gpd.read_file(structures_gpkg_path)
         if convert:
@@ -100,8 +106,10 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
             data["structures_area_sqkm"] = gdf.to_crs("EPSG:5070").geometry.area.sum() / 1e6
         else:
             data["structures_area_sqkm"] = gdf.geometry.area.sum() / 1e6
+        print(f"  Structures GeoPackage loaded in {time.time() - t0:.2f}s")
 
     if agreement_map_path and os.path.exists(agreement_map_path):
+        t0 = time.time()
         da = rxr.open_rasterio(agreement_map_path, masked=True).squeeze().compute()
         if convert:
             da = da * scale
@@ -113,11 +121,13 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
         cell_area_m2 = res_x * res_y
         n_valid = int(np.sum(~np.isnan(da.values)))
         data["raster_area_sqkm"] = n_valid * cell_area_m2 / 1e6
+        print(f"  Agreement map loaded in {time.time() - t0:.2f}s")
 
-    # Stream-order catchment analysis
-    if (catchments_path and flows_path and agreement_map_path
-            and os.path.exists(catchments_path) and os.path.exists(flows_path)
+    # Stream-order catchment analysis (expects catchments with stream_order column)
+    if (catchments_path and agreement_map_path
+            and os.path.exists(catchments_path)
             and "agreement_da" in data):
+        t0 = time.time()
         print("Loading catchments and computing stream order metrics...")
         import geopandas as gpd
         from exactextract import exact_extract
@@ -134,70 +144,55 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
         print("  Reading catchments within domain...")
         catchments = gpd.read_file(catchments_path, mask=domain_mask)
         print(f"  Found {len(catchments)} catchments in domain")
+        print(f"  Stream orders found: {sorted(catchments['stream_order'].unique())}")
 
         if len(catchments) > 0:
-            # Load flows (just ID + order_) and join
-            print("  Reading flow attributes for stream order...")
-            flows = gpd.read_file(flows_path, columns=["ID", "order_"])
-            # Drop geometry from flows for a table join
-            flows_df = pd.DataFrame({"ID": flows["ID"], "order_": flows["order_"]})
-            catchments = catchments.merge(flows_df, on="ID", how="left")
-            catchments = catchments.dropna(subset=["order_"])
-            catchments["order_"] = catchments["order_"].astype(int)
-            print(f"  Catchments with stream order: {len(catchments)}")
-            print(f"  Stream orders found: {sorted(catchments['order_'].unique())}")
+            # Write agreement raster to a temp file for exactextract
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+                tmp_path = tmp.name
+            da.rio.to_raster(tmp_path)
 
-            if len(catchments) > 0:
-                # Write agreement raster to a temp file for exactextract
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-                    tmp_path = tmp.name
-                da.rio.to_raster(tmp_path)
+            # Compute mean depth diff per dissolved catchment using exactextract
+            print("  Running zonal statistics per catchment...")
+            results = exact_extract(
+                rasterio.open(tmp_path),
+                catchments,
+                ["mean", "count"],
+                output="pandas",
+            )
+            catchments["mean_diff"] = results["mean"]
+            catchments["pixel_count"] = results["count"]
 
-                # Compute mean depth diff per catchment using exactextract
-                print("  Running zonal statistics per catchment...")
-                results = exact_extract(
-                    rasterio.open(tmp_path),
-                    catchments,
-                    ["mean", "count"],
-                    output="pandas",
-                )
-                catchments["mean_diff"] = results["mean"]
-                catchments["pixel_count"] = results["count"]
+            os.unlink(tmp_path)
 
-                os.unlink(tmp_path)
+            # Remove catchments with no valid pixels
+            catchments = catchments[catchments["pixel_count"] > 0].copy()
 
-                # Remove catchments with no valid pixels
-                catchments = catchments[catchments["pixel_count"] > 0].copy()
+            # Group by stream order
+            so_catchment_data = {}
+            so_distributions = {}
+            so_geometries = {}
+            crs = catchments.crs
+            proj_crs = crs if not crs.is_geographic else "EPSG:5070"
+            for so, grp in catchments.groupby("stream_order"):
+                so = int(so)
+                area_sqkm = float(grp.to_crs(proj_crs).geometry.area.sum() / 1e6) if crs.is_geographic else float(grp.geometry.area.sum() / 1e6)
+                so_catchment_data[so] = {
+                    "diffs": grp["mean_diff"].values,
+                    "area_sqkm": area_sqkm,
+                }
+                so_distributions[so] = grp["mean_diff"].values
+                so_geometries[so] = grp.geometry
 
-                # Save per-catchment data grouped by stream order
-                so_catchment_data = {}  # {so: {"diffs": array, "areas": array, "total_area": float}}
-                so_distributions = {}
-                so_geometries = {}
-                for so, grp in catchments.groupby("order_"):
-                    so = int(so)
-                    so_catchment_data[so] = {
-                        "diffs": grp["mean_diff"].values,
-                        "area_sqkm": float(grp["AreaSqKM"].sum()),
-                    }
-                    so_distributions[so] = grp["mean_diff"].values
-                    so_geometries[so] = grp.geometry
-
-                # Compute bias at default threshold for logging
-                default_thresh = 0.25
-                for so in sorted(so_catchment_data.keys()):
-                    d = so_catchment_data[so]["diffs"]
-                    n_under = int(np.sum(d < -default_thresh))
-                    n_match = int(np.sum(np.abs(d) <= default_thresh))
-                    n_over = int(np.sum(d > default_thresh))
-                    print(f"  SO{so}: {len(d)} catchments (under={n_under}, match={n_match}, over={n_over})")
-
-                data["so_catchment_data"] = so_catchment_data
-                data["stream_order_distributions"] = so_distributions
-                data["stream_order_geometries"] = so_geometries
+            data["so_catchment_data"] = so_catchment_data
+            data["stream_order_distributions"] = so_distributions
+            data["stream_order_geometries"] = so_geometries
+            print(f"  Catchments loaded in {time.time() - t0:.2f}s")
 
     # Load per-SO GVAL metrics from parquet files (produced by depth_compare.py)
     if so_metrics_dir and os.path.isdir(so_metrics_dir):
+        t0 = time.time()
         print(f"Loading per-SO GVAL metrics from {so_metrics_dir}...")
         combined_path = os.path.join(so_metrics_dir, "depth_metrics_by_stream_order.parquet")
         if os.path.exists(combined_path):
@@ -214,7 +209,7 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
                 so = int(row["stream_order"])
                 so_raster_metrics[so] = row.drop(["band", "stream_order"], errors="ignore").to_dict()
             data["stream_order_raster_metrics"] = so_raster_metrics
-            print(f"  Loaded GVAL metrics for stream orders: {sorted(so_raster_metrics.keys())}")
+            print(f"  Loaded GVAL metrics for stream orders: {sorted(so_raster_metrics.keys())} in {time.time() - t0:.2f}s")
 
             # Also populate bias metrics and distributions if not already loaded from catchments
             if "stream_order_metrics" not in data:
@@ -232,186 +227,216 @@ def load_data(depth_metrics_path, structures_metrics_path=None,
     return data
 
 
-def render_agreement_map(da):
-    """Render the agreement map over a dark basemap with a locator inset."""
-    from matplotlib.patches import Rectangle
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-    import pyproj
+def _fetch_basemap(da):
+    """Fetch CartoDB DarkMatter tiles for the full raster extent.
 
-    FONT = "Proxima Nova"
-    plt.rcParams["font.family"] = ["Proxima Nova", "Helvetica Neue", "Helvetica", "Arial", "sans-serif"]
+    Returns (PIL.Image, extent_3857) where extent_3857 = (west, east, south, north) in EPSG:3857.
+    """
+    from PIL import Image
+    from pyproj import Transformer
 
-    vals = da.values
-    valid = vals[~np.isnan(vals)]
-    vmax = np.percentile(np.abs(valid), 95)
+    left, bottom, right, top = da.rio.bounds()
+    src_crs = da.rio.crs
 
-    # Reproject to Web Mercator for basemap tiles
-    da_3857 = da.rio.reproject("EPSG:3857")
-    vals_3857 = da_3857.values
+    transformer = Transformer.from_crs(src_crs, "EPSG:3857", always_xy=True)
+    x0, y0 = transformer.transform(left, bottom)
+    x1, y1 = transformer.transform(right, top)
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 10), dpi=150,
-                           facecolor="none")
+    import concurrent.futures
 
-    extent_3857 = [
-        float(da_3857.x.min()), float(da_3857.x.max()),
-        float(da_3857.y.min()), float(da_3857.y.max()),
-    ]
+    def _fetch():
+        return cx.bounds2img(
+            x0, y0, x1, y1,
+            source=cx.providers.CartoDB.DarkMatterNoLabels,
+            ll=False,
+        )
 
-    # Set axis extent first so basemap tiles load for the right area
-    ax.set_xlim(extent_3857[0], extent_3857[1])
-    ax.set_ylim(extent_3857[2], extent_3857[3])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_fetch)
+        img_arr, extent = future.result(timeout=15)
 
-    # Add dark basemap FIRST (underneath)
-    cx.add_basemap(ax, source=cx.providers.CartoDB.DarkMatter, crs="EPSG:3857", attribution="")
+    img = Image.fromarray(img_arr[:, :, :3])
+    return img, extent  # extent = (west, east, south, north)
 
-    # Then overlay the agreement map on top
-    # RdBu: red = negative (under-predict), blue = positive (over-predict)
-    cmap = plt.cm.RdBu.copy()
-    cmap.set_bad(alpha=0)
-    norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
-    im = ax.imshow(
-        np.ma.masked_invalid(vals_3857), cmap=cmap, norm=norm,
-        extent=extent_3857, origin="upper", interpolation="nearest", alpha=0.7,
-        zorder=2,
-    )
+def _render_raster_to_pil(vals, vmax, max_px=1400, basemap_img=None):
+    """Apply RdBu colormap to a 2D float array and composite onto basemap or dark bg.
 
-    ax.set_facecolor("none")
+    Returns a PIL Image (RGB). Caller is responsible for encoding.
+    """
+    from PIL import Image
 
-    ax.set_title("")
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+    if basemap_img is not None:
+        bw, bh = basemap_img.size
+        if max_px and max(bw, bh) > max_px:
+            scale = max_px / max(bw, bh)
+            bw, bh = int(bw * scale), int(bh * scale)
+            basemap_img = basemap_img.resize((bw, bh), Image.LANCZOS)
 
-    # --- Locator inset map ---
-    # Convert extent to lon/lat for the inset
-    transformer = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
-    lon_min, lat_min = transformer.transform(extent_3857[0], extent_3857[2])
-    lon_max, lat_max = transformer.transform(extent_3857[1], extent_3857[3])
+        h, w = vals.shape
+        if h != bh or w != bw:
+            row_idx = np.linspace(0, h - 1, bh).astype(int)
+            col_idx = np.linspace(0, w - 1, bw).astype(int)
+            vals = vals[np.ix_(row_idx, col_idx)]
 
-    # Fixed CONUS extent for the locator inset
-    inset_lon_min = -125.0
-    inset_lon_max = -66.0
-    inset_lat_min = 24.0
-    inset_lat_max = 50.0
+        normed_01 = (np.clip(vals / vmax, -1.0, 1.0) + 1.0) / 2.0
+        rgba = plt.cm.RdBu(normed_01)
+        alpha_arr = np.where(np.isnan(vals), 0.0, 0.85)
 
-    # Convert inset bounds back to 3857
-    ix_min, iy_min = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform(inset_lon_min, inset_lat_min)
-    ix_max, iy_max = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform(inset_lon_max, inset_lat_max)
+        rgba_u8 = np.empty((bh, bw, 4), dtype=np.uint8)
+        for c in range(3):
+            rgba_u8[:, :, c] = np.clip(rgba[:, :, c] * 255, 0, 255).astype(np.uint8)
+        rgba_u8[:, :, 3] = np.clip(alpha_arr * 255, 0, 255).astype(np.uint8)
 
-    ax_inset = inset_axes(ax, width="22%", height="22%", loc="lower left",
-                          borderpad=1.5)
-    ax_inset.set_xlim(ix_min, ix_max)
-    ax_inset.set_ylim(iy_min, iy_max)
-    ax_inset.set_facecolor("#111318")
+        overlay = Image.fromarray(rgba_u8, mode="RGBA")
+        out_img = basemap_img.convert("RGB")
+        out_img.paste(overlay, (0, 0), mask=overlay)
+    else:
+        h, w = vals.shape
+        scale = min(1.0, max_px / max(h, w))
+        if scale < 1.0:
+            new_h, new_w = int(h * scale), int(w * scale)
+            row_idx = np.linspace(0, h - 1, new_h).astype(int)
+            col_idx = np.linspace(0, w - 1, new_w).astype(int)
+            vals = vals[np.ix_(row_idx, col_idx)]
 
-    google_hybrid = "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
-    cx.add_basemap(ax_inset, source=google_hybrid, crs="EPSG:3857", attribution="")
+        normed_01 = (np.clip(vals / vmax, -1.0, 1.0) + 1.0) / 2.0
+        rgba = plt.cm.RdBu(normed_01)
+        af = np.where(np.isnan(vals), 0.0, 0.85).astype(np.float32)
+        bg = np.array([26, 29, 36], dtype=np.float32)
+        out = np.empty((*vals.shape, 3), dtype=np.uint8)
+        for c in range(3):
+            out[:, :, c] = np.clip(rgba[:, :, c] * 255 * af + bg[c] * (1 - af), 0, 255).astype(np.uint8)
+        out_img = Image.fromarray(out, mode="RGB")
 
-    # Draw red rectangle showing the main map extent
-    rect = Rectangle(
-        (extent_3857[0], extent_3857[2]),
-        extent_3857[1] - extent_3857[0],
-        extent_3857[3] - extent_3857[2],
-        linewidth=2, edgecolor="#e74c3c", facecolor="none", zorder=5,
-    )
-    ax_inset.add_patch(rect)
+    return out_img
 
-    ax_inset.set_xticks([])
-    ax_inset.set_yticks([])
-    for spine in ax_inset.spines.values():
-        spine.set_edgecolor("#3a3d45")
-        spine.set_linewidth(1.5)
 
+def _pil_to_b64(img, jpeg_quality=85):
     buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="none")
-    plt.close(fig)
+    img.save(buf, format="JPEG", quality=jpeg_quality)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
-def render_stream_order_maps(da, so_geometries):
-    """Render a row of small agreement maps, each clipped to one stream order's catchments.
+def _render_raster_to_b64(vals, vmax, max_px=1400, jpeg_quality=85, basemap_img=None):
+    return _pil_to_b64(_render_raster_to_pil(vals, vmax, max_px=max_px, basemap_img=basemap_img), jpeg_quality)
 
-    Returns a dict {stream_order: base64_png_string} for orders that have valid data.
-    """
-    from rasterio.features import geometry_mask
-    import pyproj
 
-    FONT = "Proxima Nova"
-    plt.rcParams["font.family"] = ["Proxima Nova", "Helvetica Neue", "Helvetica", "Arial", "sans-serif"]
+def _add_inset_map(img, da):
+    """Composite a CONUS locator inset with HUC bounding box onto the bottom-left of img."""
+    from PIL import Image, ImageDraw
+    from pyproj import Transformer
+    import concurrent.futures
 
-    vals = da.values
+    to_4326 = Transformer.from_crs(da.rio.crs, "EPSG:4326", always_xy=True)
+    to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+    left, bottom, right, top = da.rio.bounds()
+    lon_min, lat_min = to_4326.transform(left, bottom)
+    lon_max, lat_max = to_4326.transform(right, top)
+
+    # Tighter CONUS bounds
+    ix_min, iy_min = to_3857.transform(-120.0, 25.0)
+    ix_max, iy_max = to_3857.transform(-67.0, 49.5)
+    hx_min, hy_min = to_3857.transform(lon_min, lat_min)
+    hx_max, hy_max = to_3857.transform(lon_max, lat_max)
+
+    def _fetch():
+        return cx.bounds2img(ix_min, iy_min, ix_max, iy_max, zoom=5,
+                             source=cx.providers.CartoDB.DarkMatter, ll=False)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            inset_arr, inset_extent = executor.submit(_fetch).result(timeout=15)
+
+        inset_img = Image.fromarray(inset_arr[:, :, :3])
+        iw, ih = inset_img.size
+        west, east, south, north = inset_extent
+
+        rx0 = int((hx_min - west) / (east - west) * iw)
+        rx1 = int((hx_max - west) / (east - west) * iw)
+        ry0 = int((north - hy_max) / (north - south) * ih)
+        ry1 = int((north - hy_min) / (north - south) * ih)
+
+        draw = ImageDraw.Draw(inset_img)
+        draw.rectangle([rx0, ry0, rx1, ry1], outline="#e74c3c", width=3)
+
+        target_w = max(120, int(img.width * 0.22))
+        target_h = int(ih * target_w / iw)
+        inset_img = inset_img.resize((target_w, target_h), Image.LANCZOS)
+
+        # White border around the inset
+        bordered_w = target_w + 4
+        bordered_h = target_h + 4
+        bordered = Image.new("RGB", (bordered_w, bordered_h), (220, 220, 220))
+        bordered.paste(inset_img, (2, 2))
+
+        pad = 12
+        img.paste(bordered, (pad, img.height - bordered_h - pad))
+    except Exception as e:
+        print(f"    inset map failed ({e})")
+
+    return img
+
+
+def render_agreement_map(da):
+    """Render the agreement map as a JPEG with basemap and CONUS locator inset."""
+    t0 = time.time()
+    try:
+        basemap_img, _ = _fetch_basemap(da)
+        print(f"    basemap tiles fetched: {time.time() - t0:.2f}s")
+    except Exception as e:
+        print(f"    basemap fetch failed ({e}), using dark background")
+        basemap_img = None
+
+    vals = da.values.astype(float)
     valid = vals[~np.isnan(vals)]
     vmax = float(np.percentile(np.abs(valid), 95))
 
-    cmap = plt.cm.RdBu.copy()
-    cmap.set_bad(alpha=0)
-    norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    out_img = _render_raster_to_pil(vals, vmax, max_px=1400, basemap_img=basemap_img)
+    t0 = time.time()
+    out_img = _add_inset_map(out_img, da)
+    print(f"    inset map: {time.time() - t0:.2f}s")
+    return _pil_to_b64(out_img)
 
-    # Reproject to Web Mercator for basemap
-    da_3857 = da.rio.reproject("EPSG:3857")
-    transformer = pyproj.Transformer.from_crs(da.rio.crs, "EPSG:3857", always_xy=True)
 
-    # Shared extent across all SO maps (full agreement raster extent in 3857)
-    extent_3857 = [
-        float(da_3857.x.min()), float(da_3857.x.max()),
-        float(da_3857.y.min()), float(da_3857.y.max()),
-    ]
+def render_stream_order_maps(da, so_geometries):
+    """Render per-SO agreement map clips as JPEGs composited onto a shared basemap.
+
+    All SO maps use the same full raster extent so they are visually comparable.
+    Basemap tiles are fetched once and reused for all stream orders.
+    Returns a dict {stream_order: base64_jpeg_string} for orders that have valid data.
+    """
+    vals_full = da.values.astype(float)
+    valid = vals_full[~np.isnan(vals_full)]
+    vmax = float(np.percentile(np.abs(valid), 95))
+
+    t0 = time.time()
+    try:
+        basemap_img, _ = _fetch_basemap(da)
+        print(f"    basemap tiles fetched: {time.time() - t0:.2f}s")
+    except Exception as e:
+        print(f"    basemap fetch failed ({e}), using dark background")
+        basemap_img = None
 
     results = {}
-    orders = sorted(so_geometries.keys())
-
-    for so in orders:
+    for so in sorted(so_geometries.keys()):
+        t_so = time.time()
         geoms = so_geometries[so]
 
-        # Clip the original raster by these catchment geometries
         try:
+            # drop=False keeps full raster extent so all SO maps are the same size
             clipped = da.rio.clip(geoms.values, da.rio.crs, drop=False, all_touched=True)
         except Exception:
             continue
 
-        clipped_vals = clipped.values
-        if np.all(np.isnan(clipped_vals)):
+        vals = clipped.values.astype(float)
+        if np.all(np.isnan(vals)):
             continue
 
-        # Reproject clipped raster to 3857
-        clipped_3857 = clipped.rio.reproject("EPSG:3857")
-
-        fig, ax = plt.subplots(1, 1, figsize=(5, 4), dpi=120, facecolor="none")
-
-        ax.set_xlim(extent_3857[0], extent_3857[1])
-        ax.set_ylim(extent_3857[2], extent_3857[3])
-
-        cx.add_basemap(ax, source=cx.providers.CartoDB.DarkMatter,
-                       crs="EPSG:3857", attribution="")
-
-        clipped_extent = [
-            float(clipped_3857.x.min()), float(clipped_3857.x.max()),
-            float(clipped_3857.y.min()), float(clipped_3857.y.max()),
-        ]
-
-        ax.imshow(
-            np.ma.masked_invalid(clipped_3857.values),
-            cmap=cmap, norm=norm,
-            extent=clipped_extent, origin="upper",
-            interpolation="nearest", alpha=0.7, zorder=2,
-        )
-
-        ax.set_facecolor("none")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        buf = BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="none")
-        plt.close(fig)
-        buf.seek(0)
-        results[so] = base64.b64encode(buf.read()).decode("utf-8")
+        results[so] = _render_raster_to_b64(vals, vmax, max_px=400, basemap_img=basemap_img)
+        print(f"    SO{so} total: {time.time() - t_so:.2f}s")
 
     return results
 
@@ -1229,7 +1254,9 @@ def build_html(data, title, paths=None, offline=True):
     """)
 
     # Key takeaways + spectrum chart at the top; run details go to the bottom
+    t0 = time.time()
     takeaway_html, details_html = build_executive_summary(data, paths)
+    print(f"  build_executive_summary: {time.time() - t0:.2f}s")
     # --- Interactive bias spectrum bars with threshold toggle ---
     import json as _json
 
@@ -1443,10 +1470,12 @@ def build_html(data, title, paths=None, offline=True):
 
     # Agreement map image
     if "agreement_da" in data:
+        t0 = time.time()
         b64 = render_agreement_map(data["agreement_da"])
+        print(f"  render_agreement_map: {time.time() - t0:.2f}s")
         sections.append(f"""
         <div class="chart-container" style="text-align:center;">
-            <img src="data:image/png;base64,{b64}" style="max-width:100%; height:auto; border-radius:4px;" />
+            <img src="data:image/jpeg;base64,{b64}" style="max-width:100%; height:auto; border-radius:4px;" />
             {_caption('Map of depth differences between the candidate and benchmark maps.'
                       '<span style="color:#7A3B50;">Red areas</span> indicate the candidate under-predicts depth; '
                       '<span style="color:#2E5280;">blue areas</span> indicate over-prediction. '
@@ -1456,7 +1485,9 @@ def build_html(data, title, paths=None, offline=True):
 
     # Agreement histogram (full width)
     if "agreement_values" in data:
+        t0 = time.time()
         hist_fig = make_agreement_histogram(data["agreement_values"])
+        print(f"  make_agreement_histogram: {time.time() - t0:.2f}s")
         hist_fig.update_layout(height=450)
         sections.append(f"""<div class="chart-container">
             {_section_title("Depth Difference Distribution", _GRID_ICON)}
@@ -1478,11 +1509,15 @@ def build_html(data, title, paths=None, offline=True):
         so_fig = None
         subplot_domains = []
         if has_so_dists:
+            t0 = time.time()
             so_fig, subplot_domains = make_stream_order_histograms(data["stream_order_distributions"])
+            print(f"  make_stream_order_histograms: {time.time() - t0:.2f}s")
 
         so_maps = {}
         if has_so_maps:
+            t0 = time.time()
             so_maps = render_stream_order_maps(data["agreement_da"], data["stream_order_geometries"])
+            print(f"  render_stream_order_maps: {time.time() - t0:.2f}s")
 
         so_orders = sorted(
             so_maps.keys() if so_maps
@@ -1537,7 +1572,7 @@ def build_html(data, title, paths=None, offline=True):
                 if so in so_maps:
                     map_cells += (
                         f'<div style="text-align:center;">'
-                        f'<img src="data:image/png;base64,{so_maps[so]}" '
+                        f'<img src="data:image/jpeg;base64,{so_maps[so]}" '
                         f'style="width:100%; height:auto; border-radius:4px;" />'
                         f'</div>'
                     )
@@ -1573,7 +1608,9 @@ def build_html(data, title, paths=None, offline=True):
 
     # Structure charts — bucket chart + per-structure histogram side by side
     if "structures_metrics" in data:
+        t0 = time.time()
         bucket_fig = make_bucket_chart(data["structures_metrics"])
+        print(f"  make_bucket_chart: {time.time() - t0:.2f}s")
         bucket_fig.update_layout(height=450)
         bucket_html = f"""{_section_title("Agreement Buckets", _HOUSE_ICON)}
             {bucket_fig.to_html(full_html=False, include_plotlyjs=False)}
@@ -1583,7 +1620,9 @@ def build_html(data, title, paths=None, offline=True):
 
         hist_html_struct = ""
         if "structures_gdf" in data:
+            t0 = time.time()
             hist_fig = make_structure_histogram(data["structures_gdf"])
+            print(f"  make_structure_histogram: {time.time() - t0:.2f}s")
             hist_fig.update_layout(height=450)
             hist_html_struct = f"""{_section_title("Depth Diff Distribution", _HOUSE_ICON)}
                 {hist_fig.to_html(full_html=False, include_plotlyjs=False)}
@@ -1773,8 +1812,7 @@ def main():
     parser.add_argument("--benchmark-map", type=str, default=None, help="Path to benchmark depth map (for summary display).")
     parser.add_argument("--structures", type=str, default=None, help="Path to structures file (for summary display).")
     parser.add_argument("--structures-source", type=str, default=None, help="URL source for structures data.")
-    parser.add_argument("--catchments", type=str, default=None, help="Path to NWM catchments GeoPackage.")
-    parser.add_argument("--flows", type=str, default=None, help="Path to NWM flows GeoPackage with stream order (order_ column).")
+    parser.add_argument("--catchments", type=str, default=None, help="Path to dissolved catchments with stream_order column.")
     parser.add_argument("--so-metrics-dir", type=str, default=None,
                         help="Directory with per-SO GVAL metrics parquets (from depth_compare.py --catchments).")
     parser.add_argument("--output", type=str, default="report.html", help="Output HTML file path.")
@@ -1784,6 +1822,7 @@ def main():
 
     args = parser.parse_args()
 
+    t_start = time.time()
     print("Loading data...")
     data = load_data(
         args.depth_metrics,
@@ -1791,7 +1830,6 @@ def main():
         structures_gpkg_path=args.structures_gpkg,
         agreement_map_path=args.agreement_map,
         catchments_path=args.catchments,
-        flows_path=args.flows,
         so_metrics_dir=args.so_metrics_dir,
         units=args.units,
     )
@@ -1803,14 +1841,19 @@ def main():
         "structures_source": args.structures_source,
     }
 
+    t_build = time.time()
+    print(f"Data loaded in {t_build - t_start:.2f}s total")
     print("Building report...")
     html = build_html(data, args.title, paths=paths)
+    t_write = time.time()
+    print(f"Report built in {t_write - t_build:.2f}s")
 
     with open(args.output, "w") as f:
         f.write(html)
 
     print(f"Report saved to {args.output}")
     print(f"File size: {os.path.getsize(args.output) / 1024:.0f} KB")
+    print(f"Total time: {time.time() - t_start:.2f}s")
 
 
 if __name__ == "__main__":
