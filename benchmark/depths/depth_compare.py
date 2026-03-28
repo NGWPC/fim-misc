@@ -371,10 +371,11 @@ def compare_structures(
         agr_nodata = -9999.0
     raster_crs = agreement_map.rio.crs
 
-    # --- Polygonize valid domain, simplify, buffer ---
+    # --- Polygonize valid domain (downsampled), buffer ---
     t_domain = time.time()
     agr_data = agreement_map.values
     agr_tf = agreement_map.rio.transform()
+    h, w = agr_data.shape
     px = abs(agr_tf.a)
 
     if np.isnan(agr_nodata):
@@ -382,8 +383,19 @@ def compare_structures(
     else:
         valid_mask = ((agr_data != agr_nodata) & np.isfinite(agr_data)).astype(np.uint8)
 
+    # Downsample to ~50m, dilate 1px (adds ~50m buffer in raster space),
+    # polygonize, then simplify at 30m tolerance.
+    from scipy.ndimage import binary_dilation
+    ds = max(1, int(50 / px))
+    ds_mask = valid_mask[::ds, ::ds]
+    ds_mask = binary_dilation(ds_mask, iterations=1).astype(np.uint8)
+    ds_tf = rasterio.transform.Affine(
+        agr_tf.a * ds, agr_tf.b, agr_tf.c,
+        agr_tf.d, agr_tf.e * ds, agr_tf.f,
+    )
+
     domain_polys = [
-        shape(geom) for geom, val in shapes(valid_mask, mask=valid_mask == 1, transform=agr_tf)
+        shape(geom) for geom, val in shapes(ds_mask, mask=ds_mask == 1, transform=ds_tf)
         if val == 1
     ]
     if not domain_polys:
@@ -391,30 +403,25 @@ def compare_structures(
             log.info("No valid cells in agreement map")
         return gpd.GeoDataFrame(), pd.DataFrame()
 
-    # Simplify and buffer each domain polygon individually
-    domain_buffered = [p.simplify(px * 2).buffer(px * 3) for p in domain_polys]
+    from shapely.ops import unary_union as _unary_union
+    domain_simple = _unary_union(domain_polys).simplify(30)
+
     if log:
         log.info(f"Flood domain polygon built in {time.time() - t_domain:.2f}s "
-                 f"({len(domain_polys)} polygons)")
-
+                 f"(ds={ds}x, {len(domain_polys)} polygons)")
     # --- Load only structures intersecting the buffered domain ---
     t1 = time.time()
+    domain_mask = gpd.GeoDataFrame(geometry=[domain_simple], crs=raster_crs)
+
     if structures_path.endswith(".parquet"):
         all_structures = gpd.read_parquet(structures_path)
-        if all_structures.crs != raster_crs:
-            all_structures = all_structures.to_crs(raster_crs)
-        # Query each domain polygon individually (fast with sindex)
-        hit_set = set()
-        for poly in domain_buffered:
-            hits = all_structures.sindex.query(poly, predicate="intersects")
-            hit_set.update(hits)
-        domain_structures = all_structures.iloc[sorted(hit_set)].copy()
+        hit_idx = all_structures.sindex.query(domain_simple, predicate="intersects")
+        domain_structures = all_structures.iloc[hit_idx].copy()
         del all_structures
+        if domain_structures.crs != raster_crs:
+            domain_structures = domain_structures.to_crs(raster_crs)
     else:
-        from shapely.ops import unary_union as _unary_union
-        domain_simple = _unary_union(domain_buffered)
-        domain_mask = gpd.GeoDataFrame(geometry=[domain_simple], crs=raster_crs)
-        domain_structures = gpd.read_file(structures_path, mask=domain_mask)
+        domain_structures = gpd.read_file(structures_path, mask=domain_mask, columns=["geometry"])
         if domain_structures.crs != raster_crs:
             domain_structures = domain_structures.to_crs(raster_crs)
     if len(domain_structures) == 0:
@@ -439,11 +446,16 @@ def compare_structures(
     )
     if _raster_ds:
         _raster_ds.close()
-    domain_structures = domain_structures.copy()
+    domain_structures = domain_structures.reset_index(drop=True).copy()
     domain_structures["mean_depth_diff"] = stats["mean"].fillna(0.0)
     domain_structures["min_depth_diff"] = stats["min"].fillna(0.0)
     domain_structures["max_depth_diff"] = stats["max"].fillna(0.0)
     domain_structures["pixel_count"] = stats["count"]
+    if log:
+        _nz = (stats["count"] > 0).sum()
+        _nn = stats["count"].isna().sum()
+        log.info(f"Stats: count>0={_nz}, NaN={_nn}, total={len(stats)}, "
+                 f"count_range=[{stats['count'].min()}, {stats['count'].max()}]")
     domain_structures = domain_structures[domain_structures["pixel_count"] > 0].copy()
 
     if log:
@@ -534,7 +546,9 @@ def compare_stream_orders(
     benchmark_map: xr.DataArray,
     agreement_map: xr.DataArray,
     catchments_path: str,
+    catchments_dissolved_path: str | None = None,
     output_dir: str | None = None,
+    so_fgb_path: str | None = None,
     metrics: str | Iterable[str] = "all",
     epsilon: float = 0.1,
     units: str = "feet",
@@ -553,8 +567,13 @@ def compare_stream_orders(
         Agreement map (candidate - benchmark).
     catchments_path : str
         Path to pre-joined catchments with stream order (GeoParquet or GPKG).
+    catchments_dissolved_path : str, optional
+        Path to pre-dissolved catchments (one row per SO with n_catchments, area_sqkm).
+        Skips runtime dissolve when writing so_fgb_path.
     output_dir : str, optional
         Directory to save per-SO metrics parquets.
+    so_fgb_path : str, optional
+        Path to save catchments GeoDataFrame with per-SO metrics joined as FlatGeobuf.
     metrics : str or list, default "all"
         Metrics to compute.
     epsilon : float, default 0.1
@@ -598,13 +617,18 @@ def compare_stream_orders(
     if len(catchments) == 0:
         return {}
 
-    if "order_" not in catchments.columns:
+    # Support both old (order_) and new (stream_order) column names
+    if "stream_order" in catchments.columns:
+        so_col = "stream_order"
+    elif "order_" in catchments.columns:
+        so_col = "order_"
+    else:
         if log:
-            log.info("No order_ column; skipping stream order analysis")
+            log.info("No stream_order or order_ column; skipping stream order analysis")
         return {}
 
-    catchments = catchments.dropna(subset=["order_"])
-    catchments["order_"] = catchments["order_"].astype(int)
+    catchments = catchments.dropna(subset=[so_col])
+    catchments[so_col] = catchments[so_col].astype(int)
 
     if catchments.crs != raster_crs:
         catchments = catchments.to_crs(raster_crs)
@@ -612,7 +636,7 @@ def compare_stream_orders(
     catchments = catchments[catchments.geometry.intersects(domain_box)].copy()
 
     if log:
-        log.info(f"Stream orders: {sorted(catchments['order_'].unique())}")
+        log.info(f"Stream orders: {sorted(catchments[so_col].unique())}")
 
     # Rasterize stream-order labels onto the agreement grid in one pass.
     # This replaces N per-SO clip operations (3 rasters * N SOs) with a
@@ -622,7 +646,7 @@ def compare_stream_orders(
     agr_shape = agreement_map.values.shape
 
     so_raster = rasterize(
-        [(geom, so) for geom, so in zip(catchments.geometry, catchments["order_"])],
+        [(geom, so) for geom, so in zip(catchments.geometry, catchments[so_col])],
         out_shape=agr_shape,
         transform=agr_tf,
         fill=0,
@@ -638,14 +662,26 @@ def compare_stream_orders(
     b_arr = benchmark_map.values.ravel()
     so_arr = so_raster.ravel()
 
-    # Build area lookup
-    area_by_so = catchments.groupby("order_")["AreaSqKM"].sum().to_dict()
-    count_by_so = catchments.groupby("order_").size().to_dict()
+    # Build area lookup — use pre-dissolved file if available
+    dissolved_gdf = None
+    if catchments_dissolved_path and os.path.exists(catchments_dissolved_path):
+        dissolved_gdf = gpd.read_file(catchments_dissolved_path)
+        if dissolved_gdf.crs != raster_crs:
+            dissolved_gdf = dissolved_gdf.to_crs(raster_crs)
+        area_by_so = dict(zip(dissolved_gdf["stream_order"], dissolved_gdf["area_sqkm"]))
+        count_by_so = dict(zip(dissolved_gdf["stream_order"], dissolved_gdf["n_catchments"]))
+        if log:
+            log.info(f"Using pre-dissolved catchments ({len(dissolved_gdf)} SOs)")
+    else:
+        if "AreaSqKM" not in catchments.columns:
+            catchments["AreaSqKM"] = catchments.geometry.area / 1e6
+        area_by_so = catchments.groupby(so_col)["AreaSqKM"].sum().to_dict()
+        count_by_so = catchments.groupby(so_col).size().to_dict()
 
     so_metrics = {}
     ft_scale = 0.3048 if units == "meters" else 1.0
 
-    for so in sorted(catchments["order_"].unique()):
+    for so in sorted(catchments[so_col].unique()):
         so = int(so)
         # Mask out nodata — handles both NaN and sentinel values like -9999
         agr_nd = agreement_map.rio.nodata if hasattr(agreement_map, "rio") else None
@@ -684,6 +720,7 @@ def compare_stream_orders(
         so_metrics[so] = metrics_table
 
     # Save outputs
+    combined = None
     if output_dir is not None and so_metrics:
         os.makedirs(output_dir, exist_ok=True)
         all_rows = []
@@ -699,6 +736,35 @@ def compare_stream_orders(
             os.path.join(output_dir, "depth_metrics_by_stream_order.parquet"),
             engine="pyarrow", index=False, compression="snappy",
         )
+
+    # Save catchments with metrics joined as FlatGeobuf
+    if so_fgb_path is not None and so_metrics:
+        if combined is None:
+            all_rows = [so_metrics[so] for so in sorted(so_metrics.keys())]
+            combined = pd.concat(all_rows, ignore_index=True)
+        metrics_cols = [c for c in combined.columns if c not in ("band",)]
+        so_metrics_df = combined[metrics_cols].copy()
+        if "stream_order" in so_metrics_df.columns:
+            so_metrics_df = so_metrics_df.rename(columns={"stream_order": so_col})
+
+        # Use pre-dissolved geometries if available; otherwise dissolve at runtime
+        if dissolved_gdf is not None:
+            base_gdf = dissolved_gdf[["stream_order", "geometry"]].rename(
+                columns={"stream_order": so_col}
+            )
+        else:
+            base_gdf = catchments.dissolve(by=so_col, as_index=False)[
+                [so_col, "geometry"]
+            ]
+
+        catchments_with_metrics = base_gdf.merge(so_metrics_df, on=so_col, how="left")
+        catchments_with_metrics = gpd.GeoDataFrame(
+            catchments_with_metrics, geometry="geometry", crs=catchments.crs
+        )
+        os.makedirs(os.path.dirname(so_fgb_path) or ".", exist_ok=True)
+        catchments_with_metrics.to_file(so_fgb_path, driver="FlatGeobuf")
+        if log:
+            log.info(f"SO catchments FGB saved: {so_fgb_path} ({len(catchments_with_metrics)} rows)")
 
     if log:
         log.info(f"Stream order analysis done in {time.time() - t0:.2f}s")
@@ -741,8 +807,12 @@ def main():
                         help="Path to save per-structure results GeoPackage.")
     parser.add_argument("--catchments_path", type=str, required=False, default=None,
                         help="Path to catchments with stream order (GeoParquet or GPKG).")
+    parser.add_argument("--catchments_dissolved_path", type=str, required=False, default=None,
+                        help="Path to pre-dissolved catchments FGB (one row per SO). Skips runtime dissolve.")
     parser.add_argument("--so_output_dir", type=str, required=False, default=None,
                         help="Directory to save per-stream-order metrics.")
+    parser.add_argument("--so_fgb_path", type=str, required=False, default=None,
+                        help="Path to save catchments with SO metrics as FlatGeobuf.")
     parser.add_argument("--units", type=str, default="feet", choices=["meters", "feet"],
                         help="Units of input rasters.")
 
@@ -798,7 +868,9 @@ def main():
                 benchmark_map=da_benchmark,
                 agreement_map=agreement_map,
                 catchments_path=args.catchments_path,
+                catchments_dissolved_path=args.catchments_dissolved_path,
                 output_dir=so_output,
+                so_fgb_path=args.so_fgb_path,
                 metrics=args.metrics,
                 epsilon=args.epsilon,
                 units=args.units,
