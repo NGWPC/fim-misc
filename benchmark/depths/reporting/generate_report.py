@@ -1289,6 +1289,17 @@ def build_html(data, title, paths=None, offline=True):
                     "n_under": n_u, "n_match": n_m, "n_over": n_o,
                     "total": n_u + n_m + n_o, "area": area,
                 }
+    elif "stream_order_metrics" in data:
+        # Fallback: use pre-aggregated SO counts (no per-threshold breakdown available)
+        for so, m in sorted(data["stream_order_metrics"].items()):
+            bar_id = f"so{so}"
+            area = _safe_area(m.get("area_sqkm"))
+            counts = {
+                "n_under": m["n_under"], "n_match": m["n_match"],
+                "n_over": m["n_over"], "total": m["n_total"], "area": area,
+            }
+            for t in thresholds:
+                bias_data.setdefault(bar_id, {})[str(t)] = counts
 
     # Build static HTML bars (default threshold) with data-id attributes for JS targeting
     def _interactive_bar(bar_id, icon_svg, label, counts):
