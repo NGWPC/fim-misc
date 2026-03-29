@@ -250,15 +250,19 @@ def _render_catchment_card(cx, cy, target_indices, all_3857, da_3857, vmax, to_w
     candidates_idx = list(all_3857.sindex.intersection(viewport.bounds))
     candidates = all_3857.iloc[candidates_idx]
 
-    for idx, row in candidates.iterrows():
-        is_target = idx in target_set
-        color = HIGHLIGHT_YELLOW if is_target else (140, 145, 165)
-        width = 2 if is_target else 1
-        for coords in _geom_rings(row.geometry):
-            px_coords = [(int(_to_px(x, y, cx, cy, half_m)[0]), int(_to_px(x, y, cx, cy, half_m)[1]))
-                         for x, y in coords]
-            if len(px_coords) >= 3:
-                draw.polygon(px_coords, outline=color, width=width)
+    # Two passes: non-targets first so yellow targets always render on top
+    for pass_targets in (False, True):
+        for idx, row in candidates.iterrows():
+            is_target = idx in target_set
+            if is_target != pass_targets:
+                continue
+            color = HIGHLIGHT_YELLOW if is_target else (38, 40, 50)
+            width = 2 if is_target else 1
+            for coords in _geom_rings(row.geometry):
+                px_coords = [(int(_to_px(x, y, cx, cy, half_m)[0]), int(_to_px(x, y, cx, cy, half_m)[1]))
+                             for x, y in coords]
+                if len(px_coords) >= 3:
+                    draw.line(px_coords + [px_coords[0]], fill=color, width=width)
 
     _draw_ticks(draw, cx, cy, half_m, to_wgs84, from_wgs84)
     return img
@@ -329,12 +333,13 @@ def _paste_inset(card_img, inset_base, da_bounds, cx, cy, half_m, pin=False):
 
     inset = Image.alpha_composite(inset, overlay).convert("RGB")
 
-    # Thin dark border around inset
-    bordered = Image.new("RGB", (INSET_SIZE + 2, INSET_SIZE + 2), (40, 44, 56))
-    bordered.paste(inset, (1, 1))
+    # Border around inset
+    b = 1
+    bordered = Image.new("RGB", (INSET_SIZE + b * 2, INSET_SIZE + b * 2), (255, 255, 255))
+    bordered.paste(inset, (b, b))
 
-    x_pos = IMG_SIZE - (INSET_SIZE + 2) - INSET_MARGIN
-    y_pos = IMG_SIZE - (INSET_SIZE + 2) - INSET_MARGIN
+    x_pos = IMG_SIZE - (INSET_SIZE + b * 2) - INSET_MARGIN
+    y_pos = IMG_SIZE - (INSET_SIZE + b * 2) - INSET_MARGIN
     card_img.paste(bordered, (x_pos, y_pos))
 
 
@@ -492,16 +497,20 @@ def build_html(structures_all, structures_worst,
                              if len(idxs) > 1 else "")
             scenario_set.add(scenario)
 
+            s_card_id = f"s_{anchor_idx}"
+            s_pretext = f"HUC: 12090301 | {sign}{val:.1f} {unit_label} ({direction}) | scenario: {scenario}"
             structure_cards_html += f"""
-      <div class="map-card" data-layer="structure" data-direction="{direction}" data-scenario="{scenario}">
+      <div class="map-card" data-layer="structure" data-direction="{direction}" data-scenario="{scenario}" data-card-id="{s_card_id}" data-note-pretext="{s_pretext}">
         <img src="data:image/jpeg;base64,{b64}" width="{IMG_SIZE}" height="{IMG_SIZE}">
         <div class="meta">
           {cluster_badge}
           <span class="val {direction}">{sign}{val:.1f} {unit_label}</span>
           <a href="{gmaps}" target="_blank" class="gmaps-link">&#x1F4CD; Maps</a>
+          <a href="map/map.html?lat={lat:.5f}&lon={lon:.5f}&zoom=17" target="_blank" class="gmaps-link">&#x1F5FA; Leaflet</a>
         </div>
         <div class="copy-bar">
           <button class="copy-btn" onclick="copyText('12090301', this)">12090301</button>
+          <button class="complete-btn" onclick="openReview('{s_card_id}')">&#9998; Review</button>
         </div>
       </div>"""
             n_structures += 1
@@ -547,18 +556,22 @@ def build_html(structures_all, structures_worst,
             anchor_fid = int(catchments_all.loc[anchor_idx, "feature_id"])
             scenario_set.add(scenario)
 
+            c_card_id = f"c_{anchor_fid}"
+            c_pretext = f"HUC: 12090301 | {so_label} | feature_id: {anchor_fid} | {sign}{val:.1f} {unit_label} ({direction}) | scenario: {scenario}"
             catchment_cards_html += f"""
-      <div class="map-card" data-layer="catchment" data-so="{anchor_so}" data-direction="{direction}" data-scenario="{scenario}">
+      <div class="map-card" data-layer="catchment" data-so="{anchor_so}" data-direction="{direction}" data-scenario="{scenario}" data-card-id="{c_card_id}" data-note-pretext="{c_pretext}">
         <img src="data:image/jpeg;base64,{b64}" width="{IMG_SIZE}" height="{IMG_SIZE}">
         <div class="meta">
           {cluster_badge}
           <span class="so-badge">{so_label}</span>
           <span class="val {direction}">{sign}{val:.1f} {unit_label}</span>
           <a href="{gmaps}" target="_blank" class="gmaps-link">&#x1F4CD; Maps</a>
+          <a href="map/map.html?lat={lat:.5f}&lon={lon:.5f}&zoom=14" target="_blank" class="gmaps-link">&#x1F5FA; Leaflet</a>
         </div>
         <div class="copy-bar">
           <button class="copy-btn" onclick="copyText('12090301', this)">12090301</button>
           <button class="copy-btn" onclick="copyText('{anchor_fid}', this)">{anchor_fid}</button>
+          <button class="complete-btn" onclick="openReview('{c_card_id}')">&#9998; Review</button>
         </div>
       </div>"""
             n_catchments += 1
@@ -671,6 +684,65 @@ button.active {{
 .copy-btn.copied {{ background: #1a3a28; color: #60d090; border-color: #2a5a40; }}
 
 .divider {{ border: none; border-top: 1px solid #1a1d26; margin: 0 24px; }}
+
+.complete-btn {{
+  font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  border: 1px solid #5a3a10; cursor: pointer;
+  background: #3a2010; color: #e08030; margin-left: auto;
+}}
+.complete-btn:hover {{ background: #4a2a18; color: #f09040; }}
+.complete-btn.reviewed {{ background: #1a3a28; color: #60d090; border-color: #2a5a40; }}
+.complete-btn.reviewed:hover {{ background: #1f4a30; color: #80e0a0; }}
+
+.note-editor {{
+  padding: 6px 8px 8px;
+  border-top: 1px solid #1e2128;
+  background: #0d0f14;
+}}
+.note-ta {{
+  width: 100%; height: 72px; resize: vertical;
+  background: #111318; color: #c8cdd8;
+  border: 1px solid #252830; border-radius: 3px;
+  font-size: 11px; padding: 5px 7px; font-family: inherit;
+}}
+.note-actions {{ display: flex; gap: 5px; margin-top: 5px; justify-content: flex-end; }}
+.save-btn  {{ background: #1a3a28; color: #60d090; border-color: #2a5a40; }}
+.save-btn:hover {{ background: #1f4a30; }}
+.cancel-btn {{ background: #1a1d26; color: #6070a0; }}
+
+.review-tags {{ display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 0 4px; }}
+.review-tag {{
+  font-size: 11px; color: #8090a0; cursor: pointer;
+  display: flex; align-items: center; gap: 3px;
+  background: #181b24; border: 1px solid #252830;
+  border-radius: 3px; padding: 2px 7px;
+}}
+.review-tag:hover {{ border-color: #404860; color: #a0b0c0; }}
+.review-tag input {{ accent-color: #60d090; cursor: pointer; }}
+
+.priority-bar {{ display: flex; gap: 5px; padding: 6px 0 2px; }}
+.pri-btn {{
+  font-size: 11px; padding: 2px 9px; border-radius: 4px; border: 1px solid #252830;
+  cursor: pointer; background: #181b24; color: #8090a0;
+}}
+.pri-btn:hover {{ border-color: #404860; color: #b0b8c8; }}
+.pri-btn.active-high {{ background: #3a1a1a; color: #e06060; border-color: #6a2a2a; }}
+.pri-btn.active-med  {{ background: #3a2e10; color: #d09040; border-color: #6a5020; }}
+.pri-btn.active-low  {{ background: #1a2e1a; color: #60a060; border-color: #2a5a2a; }}
+
+.map-card.reviewed {{ border-color: #2a3028; }}
+.reviewed-note {{
+  padding: 5px 8px 7px; font-size: 11px; color: #6a7068;
+  border-top: 1px solid #1e2128; white-space: pre-wrap; word-break: break-word;
+}}
+.reviewed-ts {{ font-size: 10px; color: #404540; margin-bottom: 2px; }}
+.priority-badge {{
+  font-size: 10px; padding: 1px 6px; border-radius: 3px; margin-left: 5px;
+  vertical-align: middle; font-weight: bold;
+}}
+.priority-badge.high {{ background: #3a1a1a; color: #e06060; border: 1px solid #6a2a2a; }}
+.priority-badge.med  {{ background: #3a2e10; color: #d09040; border: 1px solid #6a5020; }}
+.priority-badge.low  {{ background: #1a2e1a; color: #60a060; border: 1px solid #2a5a2a; }}
 </style>
 </head>
 <body>
@@ -698,6 +770,12 @@ button.active {{
     {so_buttons}
   </div>
   <div class="filter-group">
+    <span class="filter-label">Reviewed</span>
+    <button class="rev-btn active" data-rev="all">All</button>
+    <button class="rev-btn" data-rev="hide">Hide Reviewed</button>
+    <button class="rev-btn" data-rev="only">Only Reviewed</button>
+  </div>
+  <div class="filter-group">
     <span class="filter-label">Jump to</span>
     <button onclick="document.getElementById('sec-catchments').scrollIntoView({{behavior:'smooth'}})">Catchments</button>
     <button onclick="document.getElementById('sec-structures').scrollIntoView({{behavior:'smooth'}})">Structures</button>
@@ -706,7 +784,7 @@ button.active {{
 
 <section class="section" id="sec-catchments">
   <div class="section-header">
-    <h2>Worst Catchments</h2>
+    <h2>Worst Performing <span style="color:#FFD700">Catchments</span></h2>
     <span class="count" id="count-catchments">{n_catchments} shown</span>
   </div>
   <div class="grid" id="grid-catchments">
@@ -718,7 +796,7 @@ button.active {{
 
 <section class="section" id="sec-structures">
   <div class="section-header">
-    <h2>Worst Structures</h2>
+    <h2>Worst Performing <span style="color:#FFD700">Structures</span></h2>
     <span class="count" id="count-structures">{n_structures} shown</span>
   </div>
   <div class="grid" id="grid-structures">
@@ -731,6 +809,7 @@ button.active {{
   let activeDir      = 'all';
   let activeSO       = 'all';
   let activeScenario = 'all';
+  let activeRev      = 'all';
 
   function applyFilters() {{
     let cCount = 0, sCount = 0;
@@ -739,16 +818,19 @@ button.active {{
       const so       = card.dataset.so;
       const layer    = card.dataset.layer;
       const scenario = card.dataset.scenario;
+      const isReviewed = card.classList.contains('reviewed');
       const dirOk      = activeDir      === 'all' || activeDir      === dir;
       const soOk       = layer !== 'catchment' || activeSO === 'all' || activeSO === so;
       const scenarioOk = activeScenario === 'all' || activeScenario === scenario;
-      const show  = dirOk && soOk && scenarioOk;
+      const revOk      = activeRev === 'all' || (activeRev === 'hide' && !isReviewed) || (activeRev === 'only' && isReviewed);
+      const show  = dirOk && soOk && scenarioOk && revOk;
       card.style.display = show ? '' : 'none';
       if (show) {{ layer === 'catchment' ? cCount++ : sCount++; }}
     }});
     document.getElementById('count-catchments').textContent = cCount + ' shown';
     document.getElementById('count-structures').textContent = sCount + ' shown';
   }}
+  window.applyFilters = applyFilters;
 
   document.querySelectorAll('.dir-btn').forEach(btn =>
     btn.addEventListener('click', () => {{
@@ -776,15 +858,158 @@ button.active {{
       applyFilters();
     }})
   );
+
+  document.querySelectorAll('.rev-btn').forEach(btn =>
+    btn.addEventListener('click', () => {{
+      activeRev = btn.dataset.rev;
+      document.querySelectorAll('.rev-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      applyFilters();
+    }})
+  );
 }})();
 
-function copyText(text, btn) {{
-  navigator.clipboard.writeText(String(text)).then(() => {{
-    const orig = btn.textContent;
-    btn.textContent = '✓';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = orig; btn.classList.remove('copied'); }}, 1200);
+const STORE_KEY = 'triage_reviewed__' + document.title;
+
+function openReview(cardId) {{
+  const card = document.querySelector('[data-card-id="' + cardId + '"]');
+  if (!card) return;
+  const existing = card.querySelector('.note-editor');
+  if (existing) {{ existing.remove(); return; }}
+
+  const ed = document.createElement('div');
+  ed.className = 'note-editor';
+
+  // Priority buttons
+  let selectedPriority = '';
+  const priBar = document.createElement('div');
+  priBar.className = 'priority-bar';
+  [['High','high'],['Med','med'],['Low','low']].forEach(function(pair) {{
+    const pb = document.createElement('button');
+    pb.className = 'pri-btn';
+    pb.textContent = pair[0];
+    pb.addEventListener('click', function() {{
+      priBar.querySelectorAll('.pri-btn').forEach(b => b.className = 'pri-btn');
+      if (selectedPriority === pair[1]) {{
+        selectedPriority = '';
+      }} else {{
+        selectedPriority = pair[1];
+        pb.className = 'pri-btn active-' + pair[1];
+      }}
+    }});
+    priBar.appendChild(pb);
   }});
+  ed.appendChild(priBar);
+
+  // Tag checkboxes
+  const tagsDiv = document.createElement('div');
+  tagsDiv.className = 'review-tags';
+  const TAGS = ['Near a bridge','Catchment boundary issue','Confluence','Tiny catchment'];
+  const ta = document.createElement('textarea');
+  ta.className = 'note-ta';
+  ta.value = (card.dataset.notePretext || '') + '\\n\\nNotes: ';
+  TAGS.forEach(function(t) {{
+    const lbl = document.createElement('label');
+    lbl.className = 'review-tag';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.value = t;
+    cb.addEventListener('change', function() {{
+      if (cb.checked) ta.value += '\\n[\u2713] ' + t;
+    }});
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(' ' + t));
+    tagsDiv.appendChild(lbl);
+  }});
+  ed.appendChild(tagsDiv);
+  ed.appendChild(ta);
+
+  // Action buttons
+  const actions = document.createElement('div');
+  actions.className = 'note-actions';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'cancel-btn';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', function() {{ ed.remove(); }});
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'save-btn';
+  saveBtn.textContent = 'Complete Review';
+  saveBtn.addEventListener('click', function() {{ saveReview(cardId, selectedPriority); }});
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  ed.appendChild(actions);
+
+  card.appendChild(ed);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}}
+
+function saveReview(cardId, priority) {{
+  const card = document.querySelector('[data-card-id="' + cardId + '"]');
+  if (!card) return;
+  const note = card.querySelector('.note-ta').value;
+  const ts = new Date().toLocaleString();
+  card.querySelector('.note-editor').remove();
+  _markReviewed(card, note, ts, priority || '');
+  const stored = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
+  const idx = stored.findIndex(x => x.id === cardId);
+  const entry = {{ id: cardId, note, ts, priority: priority || '' }};
+  if (idx >= 0) stored[idx] = entry; else stored.push(entry);
+  localStorage.setItem(STORE_KEY, JSON.stringify(stored));
+}}
+
+function _markReviewed(card, note, ts, priority) {{
+  card.classList.add('reviewed');
+  // Remove any previous review display
+  card.querySelectorAll('.reviewed-note').forEach(el => el.remove());
+  // Add note display
+  const nd = document.createElement('div');
+  nd.className = 'reviewed-note';
+  nd.innerHTML = '<div class="reviewed-ts">' + ts + '</div>' +
+    note.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  card.appendChild(nd);
+  // Update the complete button to green + Re-review label + priority badge
+  const cb = card.querySelector('.complete-btn');
+  if (cb) {{
+    cb.classList.add('reviewed');
+    // Remove old priority badge if any
+    const oldBadge = cb.parentNode.querySelector('.priority-badge');
+    if (oldBadge) oldBadge.remove();
+    cb.textContent = '\u21a9 Re-review';
+    cb.onclick = () => openReview(card.dataset.cardId);
+    if (priority) {{
+      const badge = document.createElement('span');
+      badge.className = 'priority-badge ' + priority;
+      const labels = {{ high: 'High', med: 'Med', low: 'Low' }};
+      badge.textContent = labels[priority] || priority;
+      cb.parentNode.appendChild(badge);
+    }}
+  }}
+}}
+
+document.addEventListener('DOMContentLoaded', () => {{
+  const stored = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
+  stored.forEach(( {{ id, note, ts, priority }} ) => {{
+    const card = document.querySelector('[data-card-id="' + id + '"]');
+    if (card) _markReviewed(card, note, ts, priority || '');
+  }});
+}});
+
+function copyText(text, btn) {{
+  try {{
+    if (navigator.clipboard) {{
+      navigator.clipboard.writeText(String(text));
+    }} else {{
+      const ta = document.createElement('textarea');
+      ta.value = String(text);
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }}
+  }} catch(e) {{}}
+  const orig = btn.textContent;
+  btn.textContent = '\u2713';
+  btn.classList.add('copied');
+  setTimeout(function() {{ btn.textContent = orig; btn.classList.remove('copied'); }}, 1200);
 }}
 </script>
 
