@@ -429,11 +429,54 @@ def _build_map_html(cog_filename, structures_filename, catchments_filename,
 # Server
 # ---------------------------------------------------------------------------
 
+def _make_handler(serve_root):
+    """Create an HTTP handler that supports PUT for saving reviews.json."""
+
+    class TriageHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_PUT(self):
+            # Only allow writing reviews.json
+            path = self.translate_path(self.path)
+            if not os.path.basename(path) == "reviews.json":
+                self.send_error(403, "Only reviews.json can be written")
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            # Validate it's valid JSON
+            try:
+                json.loads(body)
+            except Exception:
+                self.send_error(400, "Invalid JSON")
+                return
+            with open(path, "wb") as f:
+                f.write(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def end_headers(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            super().end_headers()
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.end_headers()
+
+    return TriageHandler
+
+
 def _serve(output_dir, port):
     """Start a simple HTTP server serving the parent of output_dir.
 
     This way both the triage report (in the parent) and the map files
     (in output_dir) are accessible. The browser opens the map directly.
+    Supports PUT requests to save reviews.json.
     """
     # Serve from the parent of the map output dir so that both
     # triage_report.html and map/ are accessible at the same origin.
@@ -441,8 +484,7 @@ def _serve(output_dir, port):
     map_subdir = os.path.basename(os.path.abspath(output_dir))
     os.chdir(serve_root)
 
-    handler = http.server.SimpleHTTPRequestHandler
-    handler.log_message = lambda *args: None
+    handler = _make_handler(serve_root)
 
     with socketserver.TCPServer(("", port), handler) as httpd:
         map_url = f"http://localhost:{port}/{map_subdir}/map.html"
@@ -450,7 +492,7 @@ def _serve(output_dir, port):
         print(f"\n  Map:    {map_url}")
         print(f"  Report: {report_url}")
         print("  Press Ctrl+C to stop.\n")
-        webbrowser.open(map_url)
+        webbrowser.open(report_url)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

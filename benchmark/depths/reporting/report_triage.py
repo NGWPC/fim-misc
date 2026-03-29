@@ -869,7 +869,24 @@ button.active {{
   );
 }})();
 
-const STORE_KEY = 'triage_reviewed__' + document.title;
+const REVIEWS_FILE = 'reviews.json';
+
+function _loadReviews() {{
+  return fetch(REVIEWS_FILE)
+    .then(r => r.ok ? r.json() : [])
+    .catch(() => []);
+}}
+
+function _persistReviews(reviews) {{
+  return fetch(REVIEWS_FILE, {{
+    method: 'PUT',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(reviews, null, 2),
+  }}).catch(err => {{
+    console.warn('Could not save reviews to server, falling back to localStorage:', err);
+    localStorage.setItem('triage_reviews_fallback', JSON.stringify(reviews));
+  }});
+}}
 
 function openReview(cardId) {{
   const card = document.querySelector('[data-card-id="' + cardId + '"]');
@@ -950,11 +967,12 @@ function saveReview(cardId, priority) {{
   const ts = new Date().toLocaleString();
   card.querySelector('.note-editor').remove();
   _markReviewed(card, note, ts, priority || '');
-  const stored = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
-  const idx = stored.findIndex(x => x.id === cardId);
-  const entry = {{ id: cardId, note, ts, priority: priority || '' }};
-  if (idx >= 0) stored[idx] = entry; else stored.push(entry);
-  localStorage.setItem(STORE_KEY, JSON.stringify(stored));
+  _loadReviews().then(stored => {{
+    const idx = stored.findIndex(x => x.id === cardId);
+    const entry = {{ id: cardId, note, ts, priority: priority || '' }};
+    if (idx >= 0) stored[idx] = entry; else stored.push(entry);
+    _persistReviews(stored);
+  }});
 }}
 
 function _markReviewed(card, note, ts, priority) {{
@@ -987,10 +1005,11 @@ function _markReviewed(card, note, ts, priority) {{
 }}
 
 document.addEventListener('DOMContentLoaded', () => {{
-  const stored = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
-  stored.forEach(( {{ id, note, ts, priority }} ) => {{
-    const card = document.querySelector('[data-card-id="' + id + '"]');
-    if (card) _markReviewed(card, note, ts, priority || '');
+  _loadReviews().then(stored => {{
+    stored.forEach(( {{ id, note, ts, priority }} ) => {{
+      const card = document.querySelector('[data-card-id="' + id + '"]');
+      if (card) _markReviewed(card, note, ts, priority || '');
+    }});
   }});
 }});
 
