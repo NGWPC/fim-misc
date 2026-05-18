@@ -387,7 +387,7 @@ def _build_map_html(cog_filename, structures_filename, catchments_filename,
       const layer = L.geoJSON(data, {{
         style: function(feature) {{
           const so = feature.properties.stream_order || 1;
-          const weights = {{ 1: 0.6, 2: 0.9, 3: 1.3, 4: 1.8, 5: 2.5, 6: 3.5, 7: 4.5, 8: 6, 9: 8, 10: 10 }};
+          const weights = {{ 1: 0.4, 2: 0.7, 3: 1.2, 4: 2.0, 5: 3.5, 6: 5.5, 7: 8, 8: 11, 9: 15, 10: 20 }};
           return {{ color: '#2fb8a0', weight: weights[so] || 1, opacity: 0.75 }};
         }},
         onEachFeature: function(feature, layer) {{
