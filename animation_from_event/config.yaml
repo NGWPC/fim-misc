@@ -1,0 +1,104 @@
+# Flood Animation from Event Configuration
+# ===========================================
+
+# RIPPLE Collection Configuration
+collection:
+  id: "ble_12100201_UpperGuadalupe"  # CHANGE THIS to your collection ID
+  name: "Upper Guadalupe Basin"
+
+  # S3 paths for collection data (uses collection.id automatically)
+  s3:
+    bucket: "fimc-data"
+    base_path: "ripple/fim_100_domain/collections"  # Base path template
+    # Full paths are constructed as: {base_path}/{collection.id}/{filename}
+    # Example: ripple/fim_100_domain/collections/ble_12100201_UpperGuadalupe/ripple.gpkg
+
+# Event Time Series
+event:
+  start_date: "2025-07-04 08:00"  # Format: YYYY-MM-DD HH:MM (or just YYYY-MM-DD for midnight)
+  end_date: "2025-07-04 17:00"    # End time is exclusive (will generate up to but not including this time)
+
+  # NWM data source
+  nwm:
+    # For dates after 2023: noaa-nwm-pds (operational)
+    # For dates 1979-2023: noaa-nwm-retrospective-3-0-pds
+    bucket: "noaa-nwm-pds"
+    configuration: "analysis_assim"  # NWM configuration to use
+    use_anonymous: true              # Use anonymous S3 access for public buckets
+
+# FIM Generation Settings
+fim:
+  type: "extent"            # "depth" or "extent"
+  output_format: "COG"      # "VRT", "COG", or "GTIFF"
+  boundary_condition: "nd"  # "nd" (normal depth) or "kwse" (known WSE)
+
+  # Starting reach IDs for flows2fim controls
+  starting_reaches: "/data/input/start_reaches.csv"
+  # Options:
+  #   "/data/input/start_reaches.csv" - Use CSV file with reach_id,control_stage columns (default)
+  #   "auto" - Automatically detect upstream-most reaches from ripple.gpkg
+  #   "123456,789012,345678" - Comma-separated list of reach IDs
+  #    If start_reaches.csv doesn't exist, automatically falls back to "auto" mode
+
+# Animation Settings
+animation:
+  # Geographic extent (customize for your area of interest)
+  extent:
+    use_custom: true      # Set to false to use full FIM extent
+    center_lon: -99.3732  # Center longitude in degrees (example: west of Kerrville, TX)
+    center_lat: 30.0050   # Center latitude in degrees
+    size_km_ew: 15        # East-west extent (km)
+    size_km_ns: 10        # North-south extent (km)
+ 
+  # Visual settings
+  visual:
+    fps: 1.0                   # Frames per second
+    dpi: 250                   # Resolution
+    duration_last_frame: 3     # Seconds to hold last frame
+    depth_min: 0.0             # Minimum depth to display (ft)
+    depth_max: 30.0            # Maximum depth for colormap (ft)
+    colormap: "GnBu"           # Matplotlib colormap
+    figsize: [14, 10]          # Figure size in inches
+    downsample_factor: 1       # Downsample large rasters by this factor (1=no downsampling, 2=half resolution, 4=quarter, etc.)
+
+  # Overlay settings
+  overlay:
+    show_timestamp: true
+    show_colorbar: false
+    show_disclaimer: true
+    disclaimer_text: "Disclaimer: Experimental Guidance"
+    title_prefix: "Flood Extent"
+
+  # Basemap settings
+  basemap:
+    enabled: true
+    source: "OpenStreetMap.Mapnik"  # Adtl options: OpenTopoMap, Esri.WorldImagery
+    alpha: 0.5                      # Transparency (0=invisible, 1=opaque)
+
+  # County boundary settings (works for any US county)
+  county:
+    show_boundary: false  # Show county boundary outline
+    show_label: false     # Show county name label
+    name: "Kerr"          # County name (e.g., "Los Angeles", "Cook", "Miami-Dade")
+    state: "Texas"        # State name or abbreviation (e.g., "Texas" or "TX")
+
+  # Lake fill settings (optional)
+  lake_fill:
+    enabled: false
+    # file_path: "/data/input/lake_ingram.geojson"
+    depth: 5.0  # Depth to assign to lake pixels (ft)
+
+# Output Settings
+output:
+  base_dir: "/data/output"
+  video_filename: "flood_animation.mp4"
+  flow_file_suffix: "flows"  # Suffix for flow CSV files (YYYYMMDD_HHMM_{suffix}.csv)
+  keep_intermediate: true    # Keep flow files, controls, and FIMs
+
+# Processing Settings
+processing:
+  # flows2fim executable (will look in PATH if not full path)
+  flows2fim_executable: "flows2fim"
+
+  # Parallel processing
+  max_workers: 4  # Number of parallel FIM generation workers
